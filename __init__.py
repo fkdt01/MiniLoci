@@ -485,8 +485,9 @@ class MiniLociProvider:
                     continue
                 turn_id = self._vector_map.get(int(idx))
                 if turn_id:
-                    # 转换距离为相似度分数（余弦相似度）
-                    similarity = 1.0 - min(float(dist), 1.0)
+                    # IndexFlatIP 返回的是内积，对于归一化向量，内积=余弦相似度
+                    # 范围 [-1, 1]，裁剪到 [0, 1] 作为最终分数
+                    similarity = max(0.0, float(dist))
                     results.append({
                         'id': turn_id,
                         'score': similarity,
