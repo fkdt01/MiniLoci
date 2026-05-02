@@ -280,6 +280,15 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.0.1 (2026-05-02)
+
+**修复向量搜索关键 bug：**
+- 修复 `IndexFlatIP` 内积相似度计算错误（原 `1.0 - dist` 导致相似度颠倒）
+- 修复 `_hybrid_search` 懒加载条件，向量模型首次查询时正确触发加载
+- 修复 `_vector_model_loaded` 初始化顺序，避免 AttributeError
+- 添加本地模型缓存目录，避免重复下载
+- 确保后台线程中模型加载完成后再计算向量，并立即刷盘
+
 ### v1.0.0 (2026-05-02)
 
 - 修复FTS5中文搜索（jieba分词 + OR查询 + simple tokenizer）
