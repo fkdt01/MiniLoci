@@ -850,12 +850,22 @@ class MiniLociProvider:
         self._db.commit()
         
         # 异步计算向量（不阻塞主流程）
-        # 向量计算可能耗时，在后台线程处理
+        # 向量计算可能耗时（模型加载+编码），在后台线程处理
         import threading
         def _compute_vectors():
             try:
+                # 确保模型已加载（在后台线程中完成模型下载/加载）
+                model = self._get_vector_model()
+                if model is None:
+                    logger.debug("Vector model not available, skipping vector computation")
+                    return
+                
+                # 模型已就绪，计算向量
                 self._add_vector_async(user_rowid, user_content)
                 self._add_vector_async(asst_rowid, assistant_content)
+                
+                # 立即刷盘，避免向量丢失
+                self._flush_vectors()
             except Exception as e:
                 logger.debug(f"Vector computation failed (non-fatal): {e}")
         
