@@ -984,7 +984,7 @@ class MiniLociProvider:
         
         # 向量搜索
         vec_results = []
-        if self.enable_vector and self._vector_model:
+        if self.enable_vector:
             try:
                 query_vec = self._embed(query)
                 if query_vec:
