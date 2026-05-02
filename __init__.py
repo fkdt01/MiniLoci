@@ -364,12 +364,19 @@ class MiniLociProvider:
         try:
             from sentence_transformers import SentenceTransformer
             
-            # 设置HF镜像
+            # 设置HF镜像（如果环境变量未设置）
             if "HF_ENDPOINT" not in os.environ:
-                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+            
+            # 同时设置本地缓存目录，避免重复下载
+            cache_dir = Path(self.hermes_home) / "loci-archive" / "models"
+            cache_dir.mkdir(parents=True, exist_ok=True)
             
             logger.info(f"Loading vector model: {self.vector_model_name} (this may take a moment)...")
-            self._vector_model = SentenceTransformer(self.vector_model_name)
+            self._vector_model = SentenceTransformer(
+                self.vector_model_name,
+                cache_folder=str(cache_dir)
+            )
             self._vector_model_loaded = True
             logger.info(f"Vector model loaded: {self.vector_model_name}")
             return self._vector_model
