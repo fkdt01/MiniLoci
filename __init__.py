@@ -76,6 +76,7 @@ class MiniLociProvider:
         
         # 向量模型 (懒加载)
         self._vector_model = None
+        self._vector_model_loaded = False  # 先设置标记，再初始化Faiss
         self._faiss_index = None
         self._vector_map = {}  # faiss_id -> turn_id
         self._next_faiss_id = 0
@@ -89,12 +90,12 @@ class MiniLociProvider:
             try:
                 self._init_faiss()
                 self._load_vectors_from_db()
+                logger.info(f"Vector search ready: faiss_index={self._faiss_index is not None}, "
+                           f"vectors_loaded={len(self._vector_map)}, "
+                           f"model_loaded={self._vector_model_loaded}")
             except Exception as e:
                 logger.warning(f"Vector search initialization failed: {e}")
                 self.enable_vector = False
-        
-        # 向量模型懒加载标记（不立即加载）
-        self._vector_model_loaded = False
         
         # 重要性检测规则
         self.importance_rules = {
