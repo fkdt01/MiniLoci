@@ -1,3 +1,4 @@
+# MemoryProvider plugin for Hermes Agent
 """
 MiniLoci - 轻量级会话记忆系统
 
@@ -20,6 +21,7 @@ import os
 import subprocess
 import logging
 import threading
+import queue
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
@@ -60,21 +62,12 @@ class MiniLociProvider:
         self.auto_cleanup = self._config.get("auto_cleanup", True)
         self.backup_count = self._config.get("backup_count", 7)
         
-        # 数据库
-        self._db = None
-        self._init_db()
-        
-        # 信号处理
-        self._register_shutdown_hooks()
-        
-        # 会话恢复
-        self._recover_orphaned_sessions()
-        
-        # 自动清理
-        if self.auto_cleanup:
-            self._run_daily_cleanup()
-        
-        # 向量模型 (懒加载)
+        # 先初始化所有运行期状态，保证后续任一步失败时 shutdown/sync_turn 都不会访问缺失属性
+        self.session_id = session_id
+        self._shutdown_requested = threading.Event()
+        self._db_lock = threading.RLock()
+        self._vector_lock = threading.RLock()
+        self._vector_model_lock = threading.Lock()
         self._vector_model = None
         self._vector_model_loaded = False  # 先设置标记，再初始化Faiss
         self._faiss_index = None
@@ -84,18 +77,8 @@ class MiniLociProvider:
         self._flush_threshold = 100
         self._last_flush_time = time.time()
         self._flush_interval = 1800  # 30分钟
-        
-        # 初始化Faiss (如果启用)
-        if self.enable_vector:
-            try:
-                self._init_faiss()
-                self._load_vectors_from_db()
-                logger.info(f"Vector search ready: faiss_index={self._faiss_index is not None}, "
-                           f"vectors_loaded={len(self._vector_map)}, "
-                           f"model_loaded={self._vector_model_loaded}")
-            except Exception as e:
-                logger.warning(f"Vector search initialization failed: {e}")
-                self.enable_vector = False
+        self._vector_queue = queue.Queue()
+        self._vector_worker = None
         
         # 重要性检测规则
         self.importance_rules = {
@@ -132,7 +115,33 @@ class MiniLociProvider:
         # 回忆查询触发词
         self.recall_patterns = ["还记得", "之前", "上次", "我们讨论", "你说过", "那个", "以前", "早前"]
         
-        self.session_id = session_id
+        # 数据库
+        self._db = None
+        self._init_db()
+        
+        # 信号处理（gateway 常在非主线程初始化 provider，不能让 signal 注册失败中断初始化）
+        self._register_shutdown_hooks()
+        
+        # 会话恢复
+        self._recover_orphaned_sessions()
+        
+        # 自动清理
+        if self.auto_cleanup:
+            self._run_daily_cleanup()
+        
+        # 初始化Faiss与单 worker 向量队列 (如果启用)
+        if self.enable_vector:
+            try:
+                self._init_faiss()
+                self._load_vectors_from_db()
+                self._start_vector_worker()
+                logger.info(f"Vector search ready: faiss_index={self._faiss_index is not None}, "
+                           f"vectors_loaded={len(self._vector_map)}, "
+                           f"model_loaded={self._vector_model_loaded}")
+            except Exception as e:
+                logger.warning(f"Vector search initialization failed: {e}")
+                self.enable_vector = False
+        
         logger.info(f"MiniLoci initialized for session {session_id}")
     
     def _load_simple_extension(self):
@@ -240,8 +249,76 @@ class MiniLociProvider:
             self.shutdown()
             sys.exit(0)
         
-        signal.signal(signal.SIGTERM, _graceful_shutdown)
-        signal.signal(signal.SIGINT, _graceful_shutdown)
+        try:
+            signal.signal(signal.SIGTERM, _graceful_shutdown)
+            signal.signal(signal.SIGINT, _graceful_shutdown)
+        except ValueError:
+            logger.debug("Signal hooks skipped: MiniLoci initialized outside main thread")
+    
+    def _start_vector_worker(self):
+        """启动单 worker 向量队列，串行化 SentenceTransformer/Faiss/SQLite 写入。"""
+        if self._vector_worker and self._vector_worker.is_alive():
+            return
+        self._shutdown_requested.clear()
+        self._vector_worker = threading.Thread(
+            target=self._vector_worker_loop,
+            name="miniloci-vector-worker",
+            daemon=True,
+        )
+        self._vector_worker.start()
+    
+    def _vector_worker_loop(self):
+        """串行处理向量任务，避免多线程同时调用 torch/sentence-transformers。"""
+        while not self._shutdown_requested.is_set() or not self._vector_queue.empty():
+            try:
+                item = self._vector_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                if item is None:
+                    return
+                user_rowid, user_content, asst_rowid, assistant_content = item
+                model = self._get_vector_model()
+                if model is None:
+                    logger.debug("Vector model not available, skipping vector computation")
+                    continue
+                self._add_vector_async(user_rowid, user_content)
+                self._add_vector_async(asst_rowid, assistant_content)
+                self._flush_vectors()
+            except Exception as e:
+                logger.debug(f"Vector computation failed (non-fatal): {e}")
+            finally:
+                self._vector_queue.task_done()
+    
+    def _enqueue_vector_task(self, user_rowid: int, user_content: str, asst_rowid: int, assistant_content: str):
+        """提交向量任务到单 worker 队列。"""
+        if not self.enable_vector or self._shutdown_requested.is_set():
+            return
+        if self._vector_worker is None or not self._vector_worker.is_alive():
+            self._start_vector_worker()
+        self._vector_queue.put((user_rowid, user_content, asst_rowid, assistant_content))
+    
+    def _drain_vector_tasks(self, timeout: float = 30.0):
+        """等待已提交向量任务完成，shutdown 时避免 daemon 线程仍在跑 torch。"""
+        if not getattr(self, "_vector_worker", None):
+            return
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._vector_queue.unfinished_tasks == 0:
+                return
+            time.sleep(0.05)
+        logger.warning("Timed out waiting for vector tasks to finish")
+    
+    def _stop_vector_worker(self):
+        """停止向量 worker。"""
+        self._shutdown_requested.set()
+        worker = getattr(self, "_vector_worker", None)
+        if not worker:
+            return
+        self._vector_queue.put(None)
+        worker.join(timeout=5)
+        if worker.is_alive():
+            logger.warning("Vector worker did not stop within timeout")
     
     def _flush_and_close(self):
         """刷盘并关闭数据库"""
@@ -264,7 +341,9 @@ class MiniLociProvider:
         """关闭时刷盘"""
         try:
             if self.enable_vector:
+                self._drain_vector_tasks()
                 self._flush_vectors()
+                self._stop_vector_worker()
             self._flush_and_close()
         except Exception as e:
             logger.error(f"Shutdown error: {e}")
@@ -355,44 +434,53 @@ class MiniLociProvider:
     
     def _get_vector_model(self):
         """懒加载向量模型 - 首次调用时才加载"""
-        if self._vector_model is not None:
-            return self._vector_model
-        
-        if self._vector_model_loaded:
-            return None  # 已尝试加载但失败了
-        
-        try:
-            from sentence_transformers import SentenceTransformer
+        with self._vector_model_lock:
+            if self._vector_model is not None:
+                return self._vector_model
             
-            # 设置HF镜像（如果环境变量未设置）
-            if "HF_ENDPOINT" not in os.environ:
-                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+            if self._vector_model_loaded:
+                return None  # 已尝试加载但失败了
             
-            # 同时设置本地缓存目录，避免重复下载
-            cache_dir = Path(self.hermes_home) / "loci-archive" / "models"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"Loading vector model: {self.vector_model_name} (this may take a moment)...")
-            self._vector_model = SentenceTransformer(
-                self.vector_model_name,
-                cache_folder=str(cache_dir)
-            )
-            self._vector_model_loaded = True
-            logger.info(f"Vector model loaded: {self.vector_model_name}")
-            return self._vector_model
-            
-        except Exception as e:
-            logger.warning(f"Failed to load vector model: {e}")
-            self._vector_model = None
-            self._vector_model_loaded = True
-            return None
+            try:
+                from sentence_transformers import SentenceTransformer
+                
+                # 限制 torch CPU 并行度，降低 WSL/native 扩展在线程场景下的崩溃概率
+                try:
+                    import torch
+                    torch.set_num_threads(1)
+                except Exception:
+                    pass
+                
+                # 设置HF镜像（如果环境变量未设置）
+                if "HF_ENDPOINT" not in os.environ:
+                    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+                
+                # 同时设置本地缓存目录，避免重复下载
+                cache_dir = Path(self.hermes_home) / "loci-archive" / "models"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                
+                logger.info(f"Loading vector model: {self.vector_model_name} (this may take a moment)...")
+                self._vector_model = SentenceTransformer(
+                    self.vector_model_name,
+                    cache_folder=str(cache_dir)
+                )
+                self._vector_model_loaded = True
+                logger.info(f"Vector model loaded: {self.vector_model_name}")
+                return self._vector_model
+                
+            except Exception as e:
+                logger.warning(f"Failed to load vector model: {e}")
+                self._vector_model = None
+                self._vector_model_loaded = True
+                return None
     
     def _embed(self, text: str) -> list:
         """文本转向量"""
         model = self._get_vector_model()
         if model is None:
             return []
-        return model.encode(text, normalize_embeddings=True).tolist()
+        with self._vector_lock:
+            return model.encode(text, normalize_embeddings=True).tolist()
     
     def _load_vectors_from_db(self):
         """启动时从SQLite加载向量"""
@@ -431,16 +519,17 @@ class MiniLociProvider:
             if not vec:
                 return
             
-            vec_array = np.array([vec], dtype=np.float32)
-            self._faiss_index.add(vec_array)
-            
-            faiss_id = self._next_faiss_id
-            self._vector_map[faiss_id] = turn_id
-            self._next_faiss_id += 1
-            
-            # 加入待持久化队列
-            self._pending_vectors.append((turn_id, np.array(vec, dtype=np.float32).tobytes()))
-            self._check_flush()
+            with self._vector_lock:
+                vec_array = np.array([vec], dtype=np.float32)
+                self._faiss_index.add(vec_array)
+                
+                faiss_id = self._next_faiss_id
+                self._vector_map[faiss_id] = turn_id
+                self._next_faiss_id += 1
+                
+                # 加入待持久化队列
+                self._pending_vectors.append((turn_id, np.array(vec, dtype=np.float32).tobytes()))
+                self._check_flush()
         except Exception as e:
             logger.debug(f"Vector add failed (non-fatal): {e}")
     
@@ -458,14 +547,16 @@ class MiniLociProvider:
             return
         
         try:
-            self._db.executemany(
-                "UPDATE turns SET vector = ? WHERE id = ?",
-                [(vec_blob, turn_id) for turn_id, vec_blob in self._pending_vectors]
-            )
-            self._db.commit()
-            count = len(self._pending_vectors)
-            self._pending_vectors = []
-            self._last_flush_time = time.time()
+            with self._db_lock:
+                pending = list(self._pending_vectors)
+                self._db.executemany(
+                    "UPDATE turns SET vector = ? WHERE id = ?",
+                    [(vec_blob, turn_id) for turn_id, vec_blob in pending]
+                )
+                self._db.commit()
+                count = len(pending)
+                self._pending_vectors = []
+                self._last_flush_time = time.time()
             logger.debug(f"Flushed {count} vectors to database")
         except Exception as e:
             logger.warning(f"Vector flush failed: {e}")
@@ -476,14 +567,16 @@ class MiniLociProvider:
             return []
         
         try:
-            query_array = np.array([query_vec], dtype=np.float32)
-            distances, indices = self._faiss_index.search(query_array, limit)
+            with self._vector_lock:
+                query_array = np.array([query_vec], dtype=np.float32)
+                distances, indices = self._faiss_index.search(query_array, limit)
+                vector_map_snapshot = dict(self._vector_map)
             
             results = []
             for dist, idx in zip(distances[0], indices[0]):
                 if idx < 0:
                     continue
-                turn_id = self._vector_map.get(int(idx))
+                turn_id = vector_map_snapshot.get(int(idx))
                 if turn_id:
                     # IndexFlatIP 返回的是内积，对于归一化向量，内积=余弦相似度
                     # 范围 [-1, 1]，裁剪到 [0, 1] 作为最终分数
@@ -849,27 +942,8 @@ class MiniLociProvider:
         # 立即提交
         self._db.commit()
         
-        # 异步计算向量（不阻塞主流程）
-        # 向量计算可能耗时（模型加载+编码），在后台线程处理
-        import threading
-        def _compute_vectors():
-            try:
-                # 确保模型已加载（在后台线程中完成模型下载/加载）
-                model = self._get_vector_model()
-                if model is None:
-                    logger.debug("Vector model not available, skipping vector computation")
-                    return
-                
-                # 模型已就绪，计算向量
-                self._add_vector_async(user_rowid, user_content)
-                self._add_vector_async(asst_rowid, assistant_content)
-                
-                # 立即刷盘，避免向量丢失
-                self._flush_vectors()
-            except Exception as e:
-                logger.debug(f"Vector computation failed (non-fatal): {e}")
-        
-        threading.Thread(target=_compute_vectors, daemon=True).start()
+        # 异步计算向量（不阻塞主流程）：提交到单 worker 队列，避免并发调用 torch/Faiss
+        self._enqueue_vector_task(user_rowid, user_content, asst_rowid, assistant_content)
     
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """召回相关记忆"""
@@ -926,17 +1000,32 @@ class MiniLociProvider:
         
         # 4. 构建FTS查询 - 使用简单OR连接
         if expanded:
-            # 清理FTS5特殊字符
-            safe_keywords = []
-            for kw in expanded:
-                safe_kw = kw.replace('/', ' ').replace('-', ' ').replace('"', '').replace('*', '').replace('^', '').strip()
-                if safe_kw and len(safe_kw) >= 2:
-                    safe_keywords.append(safe_kw)
-            
+            safe_keywords = self._sanitize_fts_keywords(expanded)
             if safe_keywords:
                 return " OR ".join(safe_keywords)
         
-        return clean_query
+        fallback_keywords = self._sanitize_fts_keywords([clean_query])
+        return " OR ".join(fallback_keywords) if fallback_keywords else clean_query
+
+    def _sanitize_fts_keywords(self, keywords) -> List[str]:
+        """清理 FTS5 关键词，避免 / - \" * ^ 等特殊字符或用户输入的布尔词破坏 MATCH 语法。"""
+        safe_keywords = []
+        seen = set()
+        for kw in keywords:
+            if kw is None:
+                continue
+            # FTS5 特殊字符统一转为空格；保留中文、英文、数字、下划线。
+            safe_kw = re.sub(r'[/\-"*^:(){}\[\]\\]', ' ', str(kw)).strip()
+            for part in re.split(r'\s+', safe_kw):
+                part = part.strip()
+                if not part or len(part) < 2:
+                    continue
+                if part.upper() in {"OR", "AND", "NOT", "NEAR"}:
+                    continue
+                if part not in seen:
+                    seen.add(part)
+                    safe_keywords.append(part)
+        return safe_keywords
     
     def _hybrid_search(self, query: str, limit: int = 5) -> List[Dict]:
         """混合搜索 - 使用simple tokenizer + FTS5"""
@@ -992,13 +1081,17 @@ class MiniLociProvider:
             except Exception as e2:
                 logger.debug(f"LIKE fallback failed: {e2}")
         
-        # 向量搜索
+        # 向量搜索：只在模型已由后台 worker 加载且索引已有数据时启用。
+        # prefetch 不能主动触发模型加载，否则首次召回会被 sentence-transformers 冷启动阻塞。
         vec_results = []
-        if self.enable_vector:
+        if self.enable_vector and self._vector_model is not None and self._faiss_index is not None:
             try:
-                query_vec = self._embed(query)
-                if query_vec:
-                    vec_results = self._vector_search(query_vec, limit * 3)
+                with self._vector_lock:
+                    has_vectors = self._faiss_index.ntotal > 0
+                if has_vectors:
+                    query_vec = self._embed(query)
+                    if query_vec:
+                        vec_results = self._vector_search(query_vec, limit * 3)
             except Exception as e:
                 logger.debug(f"Vector search failed: {e}")
         
@@ -1237,12 +1330,13 @@ class MiniLociProvider:
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
     def _tool_search(self, args: Dict[str, Any]) -> str:
-        """工具搜索实现"""
+        """工具搜索实现：复用方案D的分词、清洗、OR 查询与时间过滤。"""
         query = args.get("query", "")
         days = args.get("days", self.window_days)
         limit = args.get("limit", 5)
         
         cutoff = time.time() - days * 24 * 3600
+        fts_query = self._expand_query(query)
         
         try:
             results = self._db.execute("""
@@ -1252,9 +1346,11 @@ class MiniLociProvider:
                 WHERE t.timestamp > ? AND turns_fts MATCH ?
                 ORDER BY rank
                 LIMIT ?
-            """, (cutoff, query, limit)).fetchall()
+            """, (cutoff, fts_query, limit)).fetchall()
             
             return json.dumps({
+                "query": query,
+                "fts_query": fts_query,
                 "results": [
                     {
                         "role": r[1],
@@ -1267,7 +1363,7 @@ class MiniLociProvider:
                 ]
             }, ensure_ascii=False)
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"query": query, "fts_query": fts_query, "error": str(e)}, ensure_ascii=False)
     
     def on_session_end(self, messages: List[Dict[str, Any]]):
         """会话结束标记"""

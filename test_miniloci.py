@@ -6,6 +6,7 @@ import pytest
 import tempfile
 import time
 import json
+import threading
 from pathlib import Path
 
 # 添加插件路径
@@ -112,6 +113,33 @@ class TestMiniLoci:
         # 更早
         assert provider._calc_time_weight(now - 100 * 3600) == 0.1
     
+    def test_initialize_from_non_main_thread_keeps_provider_usable(self):
+        """Gateway 非主线程初始化时 signal 注册失败不能中断 provider 初始化。"""
+        errors = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = MiniLociProvider()
+
+            def init_provider():
+                try:
+                    p.initialize("thread-session", hermes_home=tmpdir)
+                except Exception as exc:
+                    errors.append(exc)
+
+            t = threading.Thread(target=init_provider)
+            t.start()
+            t.join(timeout=5)
+
+            try:
+                assert not t.is_alive()
+                assert errors == []
+                assert hasattr(p, "manual_markers")
+                assert hasattr(p, "_pending_vectors")
+                p.sync_turn("记住线程初始化配置", "已记录", session_id="thread-session")
+                count = p._db.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+                assert count == 2
+            finally:
+                p.shutdown()
+
     def test_sync_turn_basic(self, provider):
         """测试基本对话保存"""
         provider.sync_turn(
@@ -144,6 +172,48 @@ class TestMiniLoci:
         """测试空搜索"""
         results = provider._hybrid_search("不存在的内容")
         assert len(results) == 0
+
+    def test_plan_d_chinese_fts_search(self, provider):
+        """方案D：中文词组通过 jieba/滑窗分词 + OR 查询可以召回。"""
+        provider.sync_turn(
+            "我们决定用Docker部署，CI/CD走GitHub Actions",
+            "好的，Docker适合微服务，上线发布流程已记录",
+            session_id="test-session"
+        )
+        result = provider.prefetch("你还记得部署方案吗？", session_id="test-session")
+        assert "Docker" in result or "部署" in result
+
+    def test_plan_d_sanitizes_fts_special_chars_and_boolean_words(self, provider):
+        """方案D：清理 CI/CD、OR 等会破坏 FTS5 MATCH 的特殊输入。"""
+        query = provider._expand_query("部署 OR CI/CD - Docker * ^")
+        assert " OR OR " not in f" {query} "
+        assert "/" not in query
+        assert "*" not in query
+        assert "^" not in query
+        assert "CI" in query or "CD" in query
+
+    def test_plan_d_tool_search_uses_expanded_query(self, provider):
+        """工具搜索也必须复用方案D，不能直接把原始中文短语交给 MATCH。"""
+        provider.sync_turn(
+            "我们决定用Docker部署",
+            "上线发布流程使用GitHub Actions",
+            session_id="test-session"
+        )
+        payload = json.loads(provider._tool_search({"query": "部署方案", "days": 3, "limit": 5}))
+        assert "fts_query" in payload
+        assert payload["results"]
+
+    def test_plan_d_time_filter_excludes_old_turns(self, provider):
+        """方案D：FTS 搜索必须保留窗口期过滤，避免旧记忆污染。"""
+        provider.sync_turn(
+            "我们决定用Docker部署",
+            "上线发布流程使用GitHub Actions",
+            session_id="test-session"
+        )
+        old_ts = time.time() - (provider.window_days + 2) * 24 * 3600
+        provider._db.execute("UPDATE turns SET timestamp = ?", (old_ts,))
+        provider._db.commit()
+        assert provider._hybrid_search("你还记得部署方案吗？") == []
     
     def test_config_schema(self, provider):
         """测试配置Schema"""
@@ -215,6 +285,13 @@ class TestMiniLociPerformance:
             yield p
             p.shutdown()
     
+    def test_vector_backend_uses_single_worker_queue(self, provider):
+        """向量计算必须串行排队，避免多线程同时调用 SentenceTransformer/Faiss。"""
+        assert hasattr(provider, "_vector_queue")
+        assert hasattr(provider, "_vector_worker")
+        assert provider._vector_worker is not None
+        assert provider._vector_worker.is_alive()
+
     def test_search_performance(self, provider):
         """测试搜索性能"""
         import time as time_module

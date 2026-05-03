@@ -283,6 +283,18 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.0.2 (2026-05-04)
+
+**稳定中文 FTS5 查询与向量后台任务：**
+- 实现方案D查询构造：`jieba` 分词 + 安全关键词清理 + `OR` 查询
+- 清理 FTS5 特殊字符与用户输入布尔词，避免 `MATCH` 语法错误
+- 在 `_hybrid_search`、LIKE fallback 与 `_tool_search` 中恢复时间窗口过滤
+- 工具搜索复用方案D，并返回 `fts_query` 便于调试
+- 将向量计算改为单 worker 队列，串行化 SentenceTransformer/Faiss 写入
+- 增加向量模型加载锁、编码锁、`torch.set_num_threads(1)` 与 shutdown drain
+- 修复非主线程初始化时 `signal.signal()` 导致 provider 初始化中断的问题
+- 补充中文 FTS、特殊字符清理、时间过滤、工具搜索与 worker 队列回归测试
+
 ### v1.0.1 (2026-05-02)
 
 **修复向量搜索关键 bug：**
