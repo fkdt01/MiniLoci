@@ -176,7 +176,7 @@ class MiniLociProvider:
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.execute("PRAGMA temp_store=MEMORY")
         
-        # 加载simple tokenizer扩展
+        # 可选加载 tokenizer 扩展（默认不需要；FTS 使用 unicode61 + Python token soup）
         self._load_simple_extension()
         
         # 创建表
@@ -547,6 +547,13 @@ class MiniLociProvider:
                     cache_dir = Path(os.path.expanduser(str(configured_cache)))
                     if cache_dir.exists() and any(cache_dir.iterdir()):
                         model_kwargs["cache_folder"] = str(cache_dir)
+
+                # Gateway 运行时必须默认只读本地缓存：
+                # SentenceTransformer/HF Hub 即使模型已缓存，也会对若干可选文件发 HEAD 请求；
+                # 网络不稳时这些请求会反复超时并阻塞向量召回。需要联网首次下载时，显式配置
+                # vector_local_files_only=false。
+                local_files_only = bool(self._config.get("vector_local_files_only", True))
+                model_kwargs["local_files_only"] = local_files_only
                 
                 logger.info(f"Loading vector model: {self.vector_model_name} (this may take a moment)...")
                 self._vector_model = SentenceTransformer(
@@ -1239,7 +1246,7 @@ class MiniLociProvider:
         return safe_keywords
     
     def _hybrid_search(self, query: str, limit: int = 5) -> List[Dict]:
-        """混合搜索 - 使用simple tokenizer + FTS5"""
+        """混合搜索 - FTS5 unicode61/token soup + 可选 numpy/Faiss 向量检索。"""
         cutoff = time.time() - self.window_days * 24 * 3600
         
         # 使用_expand_query进行分词和同义词扩展
@@ -1485,6 +1492,12 @@ class MiniLociProvider:
                 "default": "auto",
                 "type": "string",
                 "choices": ["auto", "faiss", "numpy"]
+            },
+            {
+                "key": "vector_local_files_only",
+                "description": "向量模型默认只从本地 HuggingFace 缓存加载，避免 Gateway 被在线 HEAD 请求超时阻塞；首次下载时可显式设为 false",
+                "default": True,
+                "type": "boolean"
             },
             {
                 "key": "default_style",

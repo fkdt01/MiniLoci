@@ -7,6 +7,7 @@ import tempfile
 import time
 import json
 import threading
+import types
 import numpy as np
 from pathlib import Path
 
@@ -151,6 +152,61 @@ class TestMiniLoci:
             p.on_session_end([])
             assert "Session end marking failed" not in caplog.text
 
+    def test_vector_model_loads_from_local_cache_by_default(self, monkeypatch):
+        """Gateway 环境中向量模型应默认 local_files_only，避免 HuggingFace HEAD 请求反复超时。"""
+        calls = []
+
+        class FakeSentenceTransformer:
+            def __init__(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+            def encode(self, text, normalize_embeddings=True):
+                return np.zeros(512, dtype=np.float32)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "sentence_transformers",
+            types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = MiniLociProvider()
+            p.initialize("local-cache-session", hermes_home=tmpdir)
+            try:
+                assert p._get_vector_model() is not None
+                assert calls
+                assert calls[0][0][0] == "BAAI/bge-small-zh-v1.5"
+                assert calls[0][1].get("local_files_only") is True
+            finally:
+                p.shutdown()
+
+    def test_vector_model_can_opt_out_of_local_cache_only(self, monkeypatch):
+        """需要首次联网下载时，可通过 vector_local_files_only=false 显式放开。"""
+        calls = []
+
+        class FakeSentenceTransformer:
+            def __init__(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+            def encode(self, text, normalize_embeddings=True):
+                return np.zeros(512, dtype=np.float32)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "sentence_transformers",
+            types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = MiniLociProvider()
+            p.initialize("download-session", hermes_home=tmpdir)
+            try:
+                p._config["vector_local_files_only"] = False
+                assert p._get_vector_model() is not None
+                assert calls[0][1].get("local_files_only") is False
+            finally:
+                p.shutdown()
+
     def test_sync_turn_basic(self, provider):
         """测试基本对话保存"""
         provider.sync_turn(
@@ -269,6 +325,11 @@ class TestMiniLoci:
         assert "window_days" in keys
         assert "fts_weight" in keys
         assert "vector_weight" in keys
+        assert "vector_backend" in keys
+        assert "vector_local_files_only" in keys
+        local_only_schema = next(s for s in schema if s["key"] == "vector_local_files_only")
+        assert local_only_schema["default"] is True
+        assert local_only_schema["type"] == "boolean"
     
     def test_system_prompt_block(self, provider):
         """测试系统提示块"""

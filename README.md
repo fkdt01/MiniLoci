@@ -111,6 +111,7 @@ MiniLociProvider (MemoryProvider)
 | `enable_vector` | true | 是否启用向量搜索 |
 | `vector_model` | BAAI/bge-small-zh-v1.5 | Embedding模型 |
 | `vector_backend` | auto | 向量后端：auto/faiss/numpy；Faiss缺失时自动用numpy |
+| `vector_local_files_only` | true | 向量模型默认只从本地 HuggingFace 缓存加载，避免 Gateway 被在线 HEAD 请求超时阻塞；首次下载时可设为 false |
 | `default_style` | concise | 回答风格 |
 | `auto_cleanup` | true | 自动清理过期数据 |
 | `backup_count` | 7 | 保留备份数量 |
@@ -208,6 +209,7 @@ pytest test_miniloci.py -v
 - ✅ 敏感信息过滤
 - ✅ 时间权重计算
 - ✅ 混合搜索召回
+- ✅ 向量模型默认本地缓存加载，避免 Gateway 在线 HEAD 超时
 - ✅ 配置Schema验证
 - ✅ 完整工作流集成
 
@@ -270,7 +272,7 @@ Hermes记忆系统:
 
 **Q: 向量搜索为什么慢？**
 
-首次使用需下载模型（约95MB），之后缓存本地。可通过 `enable_vector: false` 关闭。
+首次使用需要模型已在 HuggingFace 本地缓存中。为避免 Gateway 运行时被在线 HEAD 请求反复超时阻塞，默认 `vector_local_files_only: true`；如果需要首次联网下载模型，可临时设为 `false`，下载完成后建议改回 `true`。也可通过 `enable_vector: false` 关闭向量搜索，仅使用 FTS。
 
 **Q: 数据库坏了怎么办？**
 
@@ -285,6 +287,14 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 ---
 
 ## 更新日志
+
+### v1.0.4 (2026-05-11)
+
+**修复 Gateway 向量模型在线探测阻塞：**
+- `_get_vector_model()` 默认向 `SentenceTransformer` 传入 `local_files_only=True`
+- 新增 `vector_local_files_only` 配置项；首次联网下载可显式设为 `false`
+- 避免 HuggingFace Hub 对已缓存模型的可选文件发在线 HEAD 请求，在网络不稳时反复超时并阻塞召回
+- 补充本地缓存加载回归测试
 
 ### v1.0.3 (2026-05-11)
 
