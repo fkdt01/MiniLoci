@@ -73,6 +73,10 @@ class MiniLociProvider:
         self._faiss_index = None
         self._vector_map = {}  # faiss_id -> turn_id
         self._next_faiss_id = 0
+        self._vector_dimension = 512  # bge-small-zh-v1.5 / all-MiniLM-L6-v2 默认维度
+        self._vector_backend = self._config.get("vector_backend", "auto")
+        self._vector_ids = []          # numpy backend: row index -> turn_id
+        self._vector_matrix = None     # numpy backend: shape=(N, 512), float32
         self._pending_vectors = []
         self._flush_threshold = 100
         self._last_flush_time = time.time()
@@ -129,14 +133,15 @@ class MiniLociProvider:
         if self.auto_cleanup:
             self._run_daily_cleanup()
         
-        # 初始化Faiss与单 worker 向量队列 (如果启用)
+        # 初始化向量后端与单 worker 队列 (如果启用)。Faiss 只是可选加速，缺失时回退到 numpy。
         if self.enable_vector:
             try:
-                self._init_faiss()
+                self._init_vector_backend()
                 self._load_vectors_from_db()
                 self._start_vector_worker()
-                logger.info(f"Vector search ready: faiss_index={self._faiss_index is not None}, "
-                           f"vectors_loaded={len(self._vector_map)}, "
+                vector_count = self._vector_count()
+                logger.info(f"Vector search ready: backend={self._vector_backend}, "
+                           f"vectors_loaded={vector_count}, "
                            f"model_loaded={self._vector_model_loaded}")
             except Exception as e:
                 logger.warning(f"Vector search initialization failed: {e}")
@@ -145,20 +150,22 @@ class MiniLociProvider:
         logger.info(f"MiniLoci initialized for session {session_id}")
     
     def _load_simple_extension(self):
-        """加载simple tokenizer扩展"""
+        """兼容旧配置的可选 tokenizer 扩展加载。
+
+        MiniLoci 不再依赖 /tmp/simple。FTS 默认使用 SQLite 内置 unicode61 +
+        Python 预分词 token soup；只有用户显式配置 simple_extension_path 时才尝试加载。
+        """
+        ext_path = self._config.get("simple_extension_path") if hasattr(self, "_config") else None
+        if not ext_path:
+            return False
         try:
-            import os
-            # 设置jieba字典路径
-            jieba_dict_path = '/tmp/simple/build/cppjieba/src/cppjieba'
-            if os.path.exists(jieba_dict_path):
-                os.chdir(jieba_dict_path)
-            
-            # 加载扩展
             self._db.enable_load_extension(True)
-            self._db.load_extension('/tmp/simple/build/src/libsimple')
-            logger.info("Simple tokenizer extension loaded")
+            self._db.load_extension(str(ext_path))
+            logger.info(f"Optional tokenizer extension loaded: {ext_path}")
+            return True
         except Exception as e:
-            logger.warning(f"Failed to load simple extension: {e}")
+            logger.warning(f"Optional tokenizer extension unavailable: {e}")
+            return False
     
     # ==================== 数据库操作 ====================
     
@@ -197,10 +204,10 @@ class MiniLociProvider:
             );
             
             CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
-                content, 
+                content,
                 tags,
-                tokenize='simple',
-                content='turns', 
+                tokenize='unicode61',
+                content='turns',
                 content_rowid='id'
             );
             
@@ -239,8 +246,64 @@ class MiniLociProvider:
                 )
             """)
             version = 3
+
+        # v3 -> v4: 去掉 /tmp/simple tokenizer 强依赖，重建为 unicode61 + Python 预分词索引。
+        # 即使 user_version 已经是 4，只要检测到 legacy schema 也会重建，保证生产 DB 自修复。
+        if version < 4 or self._fts_needs_rebuild():
+            self._rebuild_fts_index()
+            version = max(version, 4)
         
         self._db.execute(f"PRAGMA user_version = {version}")
+
+    def _create_fts_table(self):
+        """创建内置 tokenizer 的 FTS5 表。"""
+        self._db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+                content,
+                tags,
+                tokenize='unicode61',
+                content='turns',
+                content_rowid='id'
+            )
+        """)
+
+    def _fts_needs_rebuild(self) -> bool:
+        """检测 FTS schema 是否仍依赖 legacy simple tokenizer 或缺失。"""
+        try:
+            row = self._db.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'turns_fts'"
+            ).fetchone()
+            if not row or not row[0]:
+                return True
+            sql = row[0].lower()
+            return "tokenize='simple'" in sql or 'tokenize="simple"' in sql or "unicode61" not in sql
+        except Exception:
+            return True
+
+    def _rebuild_fts_index(self):
+        """安全重建 FTS 索引：drop legacy table，创建 unicode61 表，并写入 token soup。"""
+        logger.info("Rebuilding MiniLoci FTS index with unicode61/token-soup")
+        try:
+            self._db.execute("DROP TABLE IF EXISTS turns_fts")
+        except Exception as e:
+            logger.warning(f"Dropping legacy FTS table failed, retrying after disabling extensions: {e}")
+            self._db.execute("DROP TABLE IF EXISTS turns_fts")
+
+        self._create_fts_table()
+        rows = self._db.execute("SELECT id, content, tags FROM turns ORDER BY id").fetchall()
+        if rows:
+            self._db.executemany(
+                "INSERT INTO turns_fts (rowid, content, tags) VALUES (?, ?, ?)",
+                [
+                    (
+                        row_id,
+                        self._tokenize_for_fts(content or ""),
+                        self._tokenize_for_fts(tags or ""),
+                    )
+                    for row_id, content, tags in rows
+                ]
+            )
+        logger.info(f"Rebuilt MiniLoci FTS index rows={len(rows)}")
     
     def _register_shutdown_hooks(self):
         """注册优雅关闭信号"""
@@ -424,12 +487,33 @@ class MiniLociProvider:
     
     # ==================== 向量搜索 ====================
     
+    def _init_vector_backend(self):
+        """初始化向量后端。Faiss 可选；缺失时使用 numpy 精确检索。"""
+        requested = str(self._config.get("vector_backend", self._vector_backend or "auto")).lower()
+        if requested not in {"auto", "faiss", "numpy"}:
+            requested = "auto"
+
+        self._faiss_index = None
+        self._vector_backend = "numpy"
+
+        if requested in {"auto", "faiss"}:
+            try:
+                self._init_faiss()
+                self._vector_backend = "faiss"
+            except Exception as e:
+                if requested == "faiss":
+                    logger.warning(f"Faiss requested but unavailable; falling back to numpy: {e}")
+                else:
+                    logger.info(f"Faiss unavailable; using numpy vector backend: {e}")
+
+        if self._vector_backend == "numpy":
+            logger.info("Numpy vector backend initialized")
+
     def _init_faiss(self):
         """初始化Faiss索引"""
         import faiss
         
-        dimension = 512  # bge-small-zh-v1.5
-        self._faiss_index = faiss.IndexFlatIP(dimension)  # 使用内积索引，更简单稳定
+        self._faiss_index = faiss.IndexFlatIP(self._vector_dimension)  # 使用内积索引，更简单稳定
         logger.info("Faiss index initialized (IndexFlatIP)")
     
     def _get_vector_model(self):
@@ -455,14 +539,19 @@ class MiniLociProvider:
                 if "HF_ENDPOINT" not in os.environ:
                     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
                 
-                # 同时设置本地缓存目录，避免重复下载
-                cache_dir = Path(self.hermes_home) / "loci-archive" / "models"
-                cache_dir.mkdir(parents=True, exist_ok=True)
+                # 缓存策略：默认使用 HuggingFace 全局缓存；只有显式配置且目录已有内容时才传 cache_folder。
+                # 这样不会因为 ~/.hermes/loci-archive/models 是空目录而离线加载失败。
+                model_kwargs = {}
+                configured_cache = self._config.get("vector_cache_dir")
+                if configured_cache:
+                    cache_dir = Path(os.path.expanduser(str(configured_cache)))
+                    if cache_dir.exists() and any(cache_dir.iterdir()):
+                        model_kwargs["cache_folder"] = str(cache_dir)
                 
                 logger.info(f"Loading vector model: {self.vector_model_name} (this may take a moment)...")
                 self._vector_model = SentenceTransformer(
                     self.vector_model_name,
-                    cache_folder=str(cache_dir)
+                    **model_kwargs
                 )
                 self._vector_model_loaded = True
                 logger.info(f"Vector model loaded: {self.vector_model_name}")
@@ -483,52 +572,89 @@ class MiniLociProvider:
             return model.encode(text, normalize_embeddings=True).tolist()
     
     def _load_vectors_from_db(self):
-        """启动时从SQLite加载向量"""
+        """启动时从 SQLite 加载向量到 numpy 矩阵，并在 Faiss 可用时同步加入 Faiss。"""
         cutoff = time.time() - self.window_days * 24 * 3600
         rows = self._db.execute("""
-            SELECT id, vector FROM turns 
+            SELECT id, vector FROM turns
             WHERE timestamp > ? AND vector IS NOT NULL
+            ORDER BY id
         """, (cutoff,)).fetchall()
-        
-        if not rows:
-            return
-        
+
+        self._vector_ids = []
+        self._vector_matrix = None
+        self._vector_map = {}
+        self._next_faiss_id = 0
+
         vectors = []
+        ids = []
         for turn_id, vec_blob in rows:
             try:
                 vec = np.frombuffer(vec_blob, dtype=np.float32)
-                if len(vec) == 512:
+                if len(vec) == self._vector_dimension:
                     vectors.append(vec)
-                    self._vector_map[self._next_faiss_id] = turn_id
-                    self._next_faiss_id += 1
+                    ids.append(turn_id)
             except Exception:
                 continue
-        
-        if vectors:
-            vectors_array = np.array(vectors)
-            self._faiss_index.add(vectors_array)
-            logger.info(f"Loaded {len(vectors)} vectors into Faiss")
-    
+
+        if not vectors:
+            return
+
+        vectors_array = np.vstack(vectors).astype(np.float32)
+        with self._vector_lock:
+            self._vector_ids = list(ids)
+            self._vector_matrix = vectors_array
+            if self._faiss_index is not None:
+                self._faiss_index.add(vectors_array)
+                for turn_id in ids:
+                    self._vector_map[self._next_faiss_id] = turn_id
+                    self._next_faiss_id += 1
+        logger.info(f"Loaded {len(vectors)} vectors into {self._vector_backend} backend")
+
+    def _vector_count(self) -> int:
+        """当前已加载向量数量。"""
+        if self._faiss_index is not None:
+            try:
+                return int(self._faiss_index.ntotal)
+            except Exception:
+                pass
+        return len(self._vector_ids)
+
+    def _has_vector_index(self) -> bool:
+        return self._vector_count() > 0
+
+    def _append_vector_to_index(self, turn_id: int, vec_array: np.ndarray) -> bool:
+        """把单条向量加入当前内存索引（numpy 始终可用，Faiss 可选）。"""
+        vec_array = np.asarray(vec_array, dtype=np.float32).reshape(-1)
+        if len(vec_array) != self._vector_dimension:
+            logger.debug(f"Skip vector with unexpected dimension: {len(vec_array)}")
+            return False
+
+        with self._vector_lock:
+            if turn_id not in self._vector_ids:
+                if self._vector_matrix is None:
+                    self._vector_matrix = vec_array.reshape(1, -1)
+                else:
+                    self._vector_matrix = np.vstack([self._vector_matrix, vec_array.reshape(1, -1)])
+                self._vector_ids.append(turn_id)
+
+            if self._faiss_index is not None and turn_id not in self._vector_map.values():
+                self._faiss_index.add(vec_array.reshape(1, -1))
+                self._vector_map[self._next_faiss_id] = turn_id
+                self._next_faiss_id += 1
+        return True
+
     def _add_vector_async(self, turn_id: int, text: str):
-        """异步添加向量"""
-        if not self.enable_vector or not self._faiss_index:
+        """异步添加向量；Faiss 缺失时仍使用 numpy backend。"""
+        if not self.enable_vector:
             return
         
         try:
             vec = self._embed(text)
             if not vec:
                 return
-            
-            with self._vector_lock:
-                vec_array = np.array([vec], dtype=np.float32)
-                self._faiss_index.add(vec_array)
-                
-                faiss_id = self._next_faiss_id
-                self._vector_map[faiss_id] = turn_id
-                self._next_faiss_id += 1
-                
-                # 加入待持久化队列
-                self._pending_vectors.append((turn_id, np.array(vec, dtype=np.float32).tobytes()))
+            vec_array = np.array(vec, dtype=np.float32)
+            if self._append_vector_to_index(turn_id, vec_array):
+                self._pending_vectors.append((turn_id, vec_array.tobytes()))
                 self._check_flush()
         except Exception as e:
             logger.debug(f"Vector add failed (non-fatal): {e}")
@@ -560,33 +686,93 @@ class MiniLociProvider:
             logger.debug(f"Flushed {count} vectors to database")
         except Exception as e:
             logger.warning(f"Vector flush failed: {e}")
+
+    def backfill_vectors(self, *, limit: Optional[int] = None, since_days: Optional[int] = None, batch_size: int = 32) -> Dict[str, Any]:
+        """为已有 turns 补齐缺失向量，并刷新内存索引。"""
+        if not self.enable_vector:
+            return {"updated": 0, "scanned": 0, "error": "vector disabled"}
+
+        model = self._get_vector_model()
+        if model is None:
+            return {"updated": 0, "scanned": 0, "error": "vector model unavailable"}
+
+        params = []
+        where = ["vector IS NULL"]
+        if since_days is not None:
+            where.append("timestamp > ?")
+            params.append(time.time() - since_days * 24 * 3600)
+        sql = f"SELECT id, content FROM turns WHERE {' AND '.join(where)} ORDER BY id"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._db.execute(sql, tuple(params)).fetchall()
+
+        updated = 0
+        for start in range(0, len(rows), max(1, batch_size)):
+            batch = rows[start:start + max(1, batch_size)]
+            texts = [content for _, content in batch]
+            try:
+                with self._vector_lock:
+                    embeddings = model.encode(texts, normalize_embeddings=True)
+                vectors = np.asarray(embeddings, dtype=np.float32)
+                if vectors.ndim == 1:
+                    vectors = vectors.reshape(1, -1)
+                pending = []
+                for (turn_id, _), vec in zip(batch, vectors):
+                    if len(vec) != self._vector_dimension:
+                        continue
+                    blob = np.asarray(vec, dtype=np.float32).tobytes()
+                    pending.append((blob, turn_id))
+                    self._append_vector_to_index(turn_id, vec)
+                if pending:
+                    with self._db_lock:
+                        self._db.executemany("UPDATE turns SET vector = ? WHERE id = ?", pending)
+                        self._db.commit()
+                    updated += len(pending)
+            except Exception as e:
+                logger.warning(f"Vector backfill batch failed: {e}")
+
+        return {"updated": updated, "scanned": len(rows), "backend": self._vector_backend}
     
     def _vector_search(self, query_vec: list, limit: int = 10) -> List[Dict]:
-        """Faiss向量搜索"""
-        if not self._faiss_index or not query_vec:
+        """向量搜索：优先 Faiss；无 Faiss 时使用 numpy 矩阵乘法。"""
+        if not query_vec:
             return []
         
         try:
             with self._vector_lock:
-                query_array = np.array([query_vec], dtype=np.float32)
-                distances, indices = self._faiss_index.search(query_array, limit)
-                vector_map_snapshot = dict(self._vector_map)
-            
+                query_array = np.array(query_vec, dtype=np.float32).reshape(-1)
+                if len(query_array) != self._vector_dimension:
+                    return []
+
+                if self._faiss_index is not None and self._faiss_index.ntotal > 0:
+                    distances, indices = self._faiss_index.search(query_array.reshape(1, -1), limit)
+                    vector_map_snapshot = dict(self._vector_map)
+                    pairs = [
+                        (vector_map_snapshot.get(int(idx)), max(0.0, float(dist)))
+                        for dist, idx in zip(distances[0], indices[0])
+                        if idx >= 0
+                    ]
+                elif self._vector_matrix is not None and len(self._vector_ids) > 0:
+                    matrix = np.asarray(self._vector_matrix, dtype=np.float32)
+                    scores = matrix @ query_array
+                    top_indices = np.argsort(-scores)[:limit]
+                    ids_snapshot = list(self._vector_ids)
+                    pairs = [
+                        (ids_snapshot[int(idx)], max(0.0, float(scores[int(idx)])))
+                        for idx in top_indices
+                    ]
+                else:
+                    return []
+
             results = []
-            for dist, idx in zip(distances[0], indices[0]):
-                if idx < 0:
-                    continue
-                turn_id = vector_map_snapshot.get(int(idx))
+            for turn_id, similarity in pairs:
                 if turn_id:
-                    # IndexFlatIP 返回的是内积，对于归一化向量，内积=余弦相似度
-                    # 范围 [-1, 1]，裁剪到 [0, 1] 作为最终分数
-                    similarity = max(0.0, float(dist))
                     results.append({
                         'id': turn_id,
                         'score': similarity,
                         'source': 'vector'
                     })
-            
             return results
         except Exception as e:
             logger.debug(f"Vector search failed: {e}")
@@ -920,15 +1106,15 @@ class MiniLociProvider:
         )
         asst_rowid = cursor.lastrowid
         
-        # 同步FTS
+        # 同步FTS：写入 Python 预分词 token soup，避免依赖 native 中文 tokenizer。
         try:
             self._db.execute(
                 "INSERT INTO turns_fts (rowid, content, tags) VALUES (?, ?, ?)",
-                (user_rowid, user_content, json.dumps(tags))
+                (user_rowid, self._tokenize_for_fts(user_content), self._tokenize_for_fts(json.dumps(tags, ensure_ascii=False)))
             )
             self._db.execute(
                 "INSERT INTO turns_fts (rowid, content, tags) VALUES (?, ?, ?)",
-                (asst_rowid, assistant_content, json.dumps(tags))
+                (asst_rowid, self._tokenize_for_fts(assistant_content), self._tokenize_for_fts(json.dumps(tags, ensure_ascii=False)))
             )
         except Exception as e:
             logger.debug(f"FTS sync failed: {e}")
@@ -957,55 +1143,80 @@ class MiniLociProvider:
         """检测回忆查询"""
         return any(p in query for p in self.recall_patterns)
     
-    def _expand_query(self, query: str) -> str:
-        """同义词扩展 - 先剔除触发词，再分词扩展"""
-        # 1. 剔除触发词，保留实质内容
-        clean_query = query
+    def _strip_recall_triggers(self, query: str) -> str:
+        """剔除“你还记得/之前/上次”等触发词，保留实质查询内容。"""
+        clean_query = query or ""
         for pattern in self.recall_patterns:
-            clean_query = clean_query.replace(pattern, '')
-        clean_query = clean_query.strip('？?吗呢吧')
-        if not clean_query:
-            clean_query = query  # 如果剔完为空，用原查询
-        
-        # 2. 分词
+            clean_query = clean_query.replace(pattern, "")
+        clean_query = re.sub(r"[你我他她它们咱的那个这个一下还记得吗呢吧？?。！!，,、]+", " ", clean_query)
+        clean_query = re.sub(r"\s+", " ", clean_query).strip()
+        return clean_query or (query or "")
+
+    def _segment_text(self, text: str) -> List[str]:
+        """中英混合分词：优先 jieba；无 jieba 时使用中文 2-4 字滑窗 + ASCII token。"""
+        text = str(text or "")
+        words: List[str] = []
+
+        # ASCII 技术词先保留，避免 MiniLoci/Faiss/Docker/CI 这类词丢失。
+        words.extend(re.findall(r"[A-Za-z][A-Za-z0-9_]*|[0-9]+[A-Za-z0-9_]*", text))
+
         try:
             import jieba
-            words = jieba.lcut(clean_query)
+            for token in jieba.lcut(text):
+                token = token.strip()
+                if token:
+                    words.append(token)
         except ImportError:
-            # jieba未安装时，按2-4字滑动窗口拆分
-            words = []
-            for i in range(len(clean_query) - 1):
-                for size in [4, 3, 2]:
-                    if i + size <= len(clean_query):
-                        chunk = clean_query[i:i + size]
-                        if len(chunk) >= 2 and not chunk.isdigit():
-                            words.append(chunk)
-            # 去重
-            seen = set()
-            unique_words = []
-            for w in words:
-                if w not in seen:
-                    seen.add(w)
-                    unique_words.append(w)
-            words = unique_words[:20]
-        
-        # 3. 扩展同义词
-        expanded = set()
+            for chunk in re.findall(r"[\u4e00-\u9fff]+", text):
+                if 2 <= len(chunk) <= 8:
+                    words.append(chunk)
+                for i in range(len(chunk)):
+                    for size in (4, 3, 2):
+                        if i + size <= len(chunk):
+                            words.append(chunk[i:i + size])
+
+        # 对含中英文混合的短片段再拆一次 ASCII/中文，减少 jieba 不可用或 JSON tags 的噪声。
+        for chunk in re.findall(r"[\u4e00-\u9fff]{2,8}|[A-Za-z][A-Za-z0-9_]*", text):
+            words.append(chunk)
+
+        seen = set()
+        unique_words = []
         for word in words:
-            word = word.strip()
-            if len(word) >= 2:
-                expanded.add(word)
-                if word in self.synonyms:
-                    expanded.update(self.synonyms[word])
-        
-        # 4. 构建FTS查询 - 使用简单OR连接
-        if expanded:
-            safe_keywords = self._sanitize_fts_keywords(expanded)
-            if safe_keywords:
-                return " OR ".join(safe_keywords)
-        
-        fallback_keywords = self._sanitize_fts_keywords([clean_query])
-        return " OR ".join(fallback_keywords) if fallback_keywords else clean_query
+            word = str(word).strip()
+            if not word or len(word) < 2:
+                continue
+            if word not in seen:
+                seen.add(word)
+                unique_words.append(word)
+        return unique_words
+
+    def _search_terms(self, text: str, *, expand_synonyms: bool = True) -> List[str]:
+        """生成安全搜索词，供 FTS MATCH、token soup 和 LIKE fallback 复用。"""
+        expanded = []
+        for word in self._segment_text(text):
+            expanded.append(word)
+            if expand_synonyms and word in self.synonyms:
+                expanded.extend(self.synonyms[word])
+        return self._sanitize_fts_keywords(expanded)
+
+    def _tokenize_for_fts(self, *texts: str) -> str:
+        """把原文转换成 FTS 可索引的 token soup。"""
+        terms: List[str] = []
+        for text in texts:
+            terms.extend(self._search_terms(text, expand_synonyms=True))
+        seen = set()
+        unique_terms = []
+        for term in terms:
+            if term not in seen:
+                seen.add(term)
+                unique_terms.append(term)
+        return " ".join(unique_terms)
+
+    def _expand_query(self, query: str) -> str:
+        """同义词扩展 - 先剔除触发词，再分词扩展，输出安全 OR 查询。"""
+        clean_query = self._strip_recall_triggers(query)
+        safe_keywords = self._search_terms(clean_query, expand_synonyms=True)
+        return " OR ".join(safe_keywords)
 
     def _sanitize_fts_keywords(self, keywords) -> List[str]:
         """清理 FTS5 关键词，避免 / - \" * ^ 等特殊字符或用户输入的布尔词破坏 MATCH 语法。"""
@@ -1058,15 +1269,23 @@ class MiniLociProvider:
                 })
         except Exception as e:
             logger.debug(f"FTS search failed: {e}")
-            # 降级到LIKE查询（也加时间过滤）
+            # 降级到 LIKE 查询：使用清洗后的关键词/同义词，而不是原始“你还记得...”整句。
             try:
-                rows = self._db.execute("""
-                    SELECT id, content, role, timestamp, importance, tags
-                    FROM turns
-                    WHERE content LIKE ? AND timestamp > ?
-                    ORDER BY importance DESC, timestamp DESC
-                    LIMIT ?
-                """, (f"%{query}%", cutoff, limit * 3)).fetchall()
+                like_keywords = self._search_terms(self._strip_recall_triggers(query), expand_synonyms=True)[:12]
+                if not like_keywords:
+                    like_keywords = self._sanitize_fts_keywords([self._strip_recall_triggers(query)])[:3]
+                if like_keywords:
+                    clauses = " OR ".join(["content LIKE ?" for _ in like_keywords])
+                    params = [f"%{kw}%" for kw in like_keywords]
+                    rows = self._db.execute(f"""
+                        SELECT id, content, role, timestamp, importance, tags
+                        FROM turns
+                        WHERE ({clauses}) AND timestamp > ?
+                        ORDER BY importance DESC, timestamp DESC
+                        LIMIT ?
+                    """, (*params, cutoff, limit * 3)).fetchall()
+                else:
+                    rows = []
                 
                 for row in rows:
                     fts_results.append({
@@ -1081,17 +1300,13 @@ class MiniLociProvider:
             except Exception as e2:
                 logger.debug(f"LIKE fallback failed: {e2}")
         
-        # 向量搜索：只在模型已由后台 worker 加载且索引已有数据时启用。
-        # prefetch 不能主动触发模型加载，否则首次召回会被 sentence-transformers 冷启动阻塞。
+        # 向量搜索：Faiss 可选；numpy backend 只要内存矩阵有数据即可搜索。
         vec_results = []
-        if self.enable_vector and self._vector_model is not None and self._faiss_index is not None:
+        if self.enable_vector and self._has_vector_index():
             try:
-                with self._vector_lock:
-                    has_vectors = self._faiss_index.ntotal > 0
-                if has_vectors:
-                    query_vec = self._embed(query)
-                    if query_vec:
-                        vec_results = self._vector_search(query_vec, limit * 3)
+                query_vec = self._embed(query)
+                if query_vec:
+                    vec_results = self._vector_search(query_vec, limit * 3)
             except Exception as e:
                 logger.debug(f"Vector search failed: {e}")
         
@@ -1263,6 +1478,13 @@ class MiniLociProvider:
                     "all-MiniLM-L6-v2",
                     "paraphrase-MiniLM-L3-v2"
                 ]
+            },
+            {
+                "key": "vector_backend",
+                "description": "向量检索后端：auto/faiss/numpy；默认 auto，Faiss 缺失时自动使用 numpy",
+                "default": "auto",
+                "type": "string",
+                "choices": ["auto", "faiss", "numpy"]
             },
             {
                 "key": "default_style",

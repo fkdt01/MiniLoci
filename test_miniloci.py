@@ -7,6 +7,7 @@ import tempfile
 import time
 import json
 import threading
+import numpy as np
 from pathlib import Path
 
 # 添加插件路径
@@ -214,6 +215,40 @@ class TestMiniLoci:
         provider._db.execute("UPDATE turns SET timestamp = ?", (old_ts,))
         provider._db.commit()
         assert provider._hybrid_search("你还记得部署方案吗？") == []
+
+    def test_fts_uses_builtin_tokenizer_and_token_soup(self, provider):
+        """FTS 不再依赖 /tmp/simple，内置 tokenizer + Python 预分词能召回中文/英文技术词。"""
+        fts_sql = provider._db.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'turns_fts'"
+        ).fetchone()[0]
+        assert "unicode61" in fts_sql
+        assert "simple" not in fts_sql
+
+        provider.sync_turn(
+            "MiniLoci 向量搜索不可用，部署方案需要调整",
+            "建议用 numpy backend 替代 Faiss 强依赖",
+            session_id="test-session"
+        )
+        for query in ["MiniLoci", "向量搜索", "部署", "numpy", "Faiss"]:
+            count = provider._db.execute(
+                "SELECT COUNT(*) FROM turns_fts WHERE turns_fts MATCH ?",
+                (query,)
+            ).fetchone()[0]
+            assert count >= 1, query
+
+    def test_like_fallback_uses_clean_keywords_not_raw_recall_phrase(self, provider):
+        """FTS 异常时，LIKE fallback 应使用清洗后的关键词，而不是原始“你还记得...”整句。"""
+        provider.sync_turn(
+            "我们决定用Docker部署",
+            "上线发布流程使用GitHub Actions",
+            session_id="test-session"
+        )
+        provider._db.execute("DROP TABLE turns_fts")
+        provider._db.commit()
+
+        results = provider._hybrid_search("你还记得部署方案吗？")
+        assert results
+        assert any("Docker" in r["content"] or "部署" in r["content"] for r in results)
     
     def test_config_schema(self, provider):
         """测试配置Schema"""
@@ -291,6 +326,68 @@ class TestMiniLociPerformance:
         assert hasattr(provider, "_vector_worker")
         assert provider._vector_worker is not None
         assert provider._vector_worker.is_alive()
+
+    def test_numpy_vector_backend_without_faiss_can_search(self, provider):
+        """Faiss 缺失时，numpy backend 仍应能用已持久化向量做语义检索。"""
+        provider._db.execute(
+            "INSERT OR IGNORE INTO sessions (id, start_time, platform) VALUES (?, ?, 'test')",
+            ("vector-test", time.time())
+        )
+        cursor = provider._db.execute(
+            """INSERT INTO turns (session_id, timestamp, role, content, importance, tags, metadata)
+            VALUES (?, ?, 'user', ?, 2, ?, ?)""",
+            ("vector-test", time.time(), "语义检索目标：MiniLoci 向量恢复", json.dumps([]), json.dumps({}))
+        )
+        target_id = cursor.lastrowid
+        provider._db.commit()
+
+        vec = np.zeros(512, dtype=np.float32)
+        vec[0] = 1.0
+        provider._faiss_index = None
+        provider._vector_ids = [target_id]
+        provider._vector_matrix = np.array([vec], dtype=np.float32)
+
+        results = provider._vector_search(vec.tolist(), limit=1)
+        assert results
+        assert results[0]["id"] == target_id
+        assert results[0]["score"] > 0.99
+
+    def test_backfill_vectors_populates_missing_vectors_with_fake_model(self, provider):
+        """backfill 应把已有 turns 的缺失向量补齐，并刷新 numpy 搜索矩阵。"""
+        class FakeModel:
+            def encode(self, texts, normalize_embeddings=True):
+                if isinstance(texts, str):
+                    texts = [texts]
+                vectors = []
+                for idx, _ in enumerate(texts):
+                    vec = np.zeros(512, dtype=np.float32)
+                    vec[idx % 512] = 1.0
+                    vectors.append(vec)
+                return np.array(vectors, dtype=np.float32)
+
+        provider._vector_model = FakeModel()
+        provider._vector_model_loaded = True
+        provider.enable_vector = True
+        provider._faiss_index = None
+        provider._vector_ids = []
+        provider._vector_matrix = None
+
+        provider._db.execute(
+            "INSERT OR IGNORE INTO sessions (id, start_time, platform) VALUES (?, ?, 'test')",
+            ("backfill-test", time.time())
+        )
+        provider._db.execute(
+            """INSERT INTO turns (session_id, timestamp, role, content, importance, tags, metadata)
+            VALUES (?, ?, 'user', '需要补向量的历史记录', 2, '[]', '{}')""",
+            ("backfill-test", time.time())
+        )
+        provider._db.commit()
+
+        summary = provider.backfill_vectors(limit=10, batch_size=2)
+        assert summary["updated"] >= 1
+        assert provider._db.execute("SELECT COUNT(*) FROM turns WHERE vector IS NOT NULL").fetchone()[0] >= 1
+        assert provider._vector_matrix is not None
+        assert len(provider._vector_ids) >= 1
 
     def test_search_performance(self, provider):
         """测试搜索性能"""

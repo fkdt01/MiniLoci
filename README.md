@@ -31,7 +31,9 @@
 git clone https://github.com/yourusername/miniloci.git ~/.hermes/plugins/miniloci
 
 # 安装依赖
-pip install jieba faiss-cpu sentence-transformers
+pip install numpy sentence-transformers jieba
+# 可选：数据量很大时再安装 Faiss 加速
+# pip install faiss-cpu
 ```
 
 ### 配置
@@ -60,10 +62,10 @@ MiniLoci 会自动搜索相关历史并注入上下文。
 用户查询: "你还记得部署方案吗？"
          ↓
 1. 触发检测 — "还记得"命中触发词
-2. jieba分词 → "部署" "方案"
+2. jieba分词（不可用时自动使用中文2-4字滑窗） → "部署" "方案"
 3. 同义词扩展 → "部署"扩展出 ["上线", "发布", "构建", "Docker", "CI/CD"]
-4. FTS5搜索 — SQLite全文索引OR查询
-5. 向量语义（可选）— BAAI/bge-small-zh模型找语义相近内容
+4. FTS5搜索 — SQLite内置 unicode61 + Python 预分词 token soup OR 查询
+5. 向量语义（可选）— BAAI/bge-small-zh模型 + numpy backend；Faiss 仅作为可选加速
 6. 加权排序 → 返回前5条
 ```
 
@@ -84,8 +86,8 @@ MiniLoci 会自动搜索相关历史并注入上下文。
 MiniLociProvider (MemoryProvider)
 ├── 存储层
 │   ├── SQLite + WAL模式
-│   ├── FTS5全文索引
-│   └── Faiss向量索引（可选）
+│   ├── FTS5全文索引（unicode61 + Python 预分词）
+│   └── numpy向量索引（Faiss可选加速）
 ├── 召回层
 │   ├── 触发检测
 │   ├── jieba中文分词
@@ -108,6 +110,7 @@ MiniLociProvider (MemoryProvider)
 | `vector_weight` | 0.25 | 向量语义权重 |
 | `enable_vector` | true | 是否启用向量搜索 |
 | `vector_model` | BAAI/bge-small-zh-v1.5 | Embedding模型 |
+| `vector_backend` | auto | 向量后端：auto/faiss/numpy；Faiss缺失时自动用numpy |
 | `default_style` | concise | 回答风格 |
 | `auto_cleanup` | true | 自动清理过期数据 |
 | `backup_count` | 7 | 保留备份数量 |
@@ -219,7 +222,7 @@ pytest test_miniloci.py -v
 | 1000条 | 0.58ms | 1.01 MB |
 | 2000条 | 1.07ms | 2.23 MB |
 
-测试环境：WSL2 Ubuntu, Python 3.11, SQLite FTS5 + simple tokenizer
+测试环境：WSL2 Ubuntu, Python 3.11, SQLite FTS5 unicode61 + Python 预分词；小规模向量用 numpy backend
 
 ---
 
@@ -228,10 +231,10 @@ pytest test_miniloci.py -v
 | 依赖 | 必需 | 用途 |
 |------|------|------|
 | sqlite3 | ✅ | 数据存储 |
-| jieba | ✅ | 中文分词 |
-| faiss-cpu | ❌ | 向量搜索 |
-| sentence-transformers | ❌ | Embedding模型 |
-| numpy | ❌ | 数值计算 |
+| numpy | ✅ | 小规模向量矩阵检索 |
+| sentence-transformers | ❌ | Embedding模型（`enable_vector: true` 时需要） |
+| jieba | ❌ | 更好的中文分词；缺失时自动滑窗降级 |
+| faiss-cpu | ❌ | 大规模向量搜索可选加速 |
 
 ---
 
@@ -282,6 +285,18 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 ---
 
 ## 更新日志
+
+### v1.0.3 (2026-05-11)
+
+**去 native 化修复 MiniLoci 检索链路：**
+- FTS 表从 `/tmp/simple` tokenizer 迁移到 SQLite 内置 `unicode61`
+- 插入/重建 FTS 时写入 Python 预分词 token soup，支持中文、英文技术词和同义词召回
+- 新增 v4 DB migration：自动 drop/recreate `turns_fts` 并从 `turns` 全量重建索引
+- LIKE fallback 改用清洗后的关键词/同义词，不再用原始“你还记得...”整句
+- Faiss 改为可选后端；未安装时默认使用 numpy 矩阵乘法检索
+- 新增 `backfill_vectors()`，可为历史 turns 补齐 embedding 并刷新 numpy 索引
+- 修正 SentenceTransformer 缓存策略：默认使用全局 HuggingFace cache，避免空 cache_folder 导致离线加载失败
+- 补充 FTS schema/token soup、LIKE fallback、numpy backend、vector backfill 回归测试
 
 ### v1.0.2 (2026-05-04)
 
