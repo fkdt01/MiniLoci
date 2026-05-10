@@ -1589,6 +1589,8 @@ class MiniLociProvider:
     
     def on_session_end(self, messages: List[Dict[str, Any]]):
         """会话结束标记"""
+        if not getattr(self, "_db", None):
+            return
         if hasattr(self, 'session_id') and self.session_id:
             try:
                 self._db.execute(

@@ -141,6 +141,16 @@ class TestMiniLoci:
             finally:
                 p.shutdown()
 
+    def test_on_session_end_after_shutdown_is_quiet(self, caplog):
+        """Gateway restart/shutdown 后若 DB 已关闭，on_session_end 不应再打印误导性 warning。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = MiniLociProvider()
+            p.initialize("shutdown-session", hermes_home=tmpdir)
+            p.shutdown()
+            caplog.clear()
+            p.on_session_end([])
+            assert "Session end marking failed" not in caplog.text
+
     def test_sync_turn_basic(self, provider):
         """测试基本对话保存"""
         provider.sync_turn(
