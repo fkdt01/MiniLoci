@@ -288,6 +288,16 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.1.0 (2026-05-15)
+
+**P0 记忆架构升级：搜索更稳、结果可追溯、失败可诊断：**
+- 混合召回排序改为 RRF（Reciprocal Rank Fusion），降低 FTS/向量分数尺度不一致带来的排序波动
+- 新增 `turns.trace_id` 与 v5 DB migration，历史 turns 自动补齐 `turn-{id}` 形式的稳定追溯 ID
+- 搜索结果新增 `trace_id`、`source_turn_ids`、`source_session_id`、`search_sources`、`rrf_score`，为后续 L1/L2/L3 分层记忆打基础
+- 新增 `health_status()`，暴露 vector/FTS 降级状态、向量数量、队列积压等诊断信息
+- 向量召回失败时自动降级保留 FTS/LIKE 结果，并记录 `last_vector_error`
+- 测试扩展到 34 项，覆盖 RRF、trace metadata 与 degraded fallback
+
 ### v1.0.4 (2026-05-11)
 
 **修复 Gateway 向量模型在线探测阻塞：**

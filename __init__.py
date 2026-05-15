@@ -83,6 +83,10 @@ class MiniLociProvider:
         self._flush_interval = 1800  # 30分钟
         self._vector_queue = queue.Queue()
         self._vector_worker = None
+        self._last_vector_error = None
+        self._last_vector_error_time = None
+        self._last_fts_error = None
+        self._last_fts_error_time = None
         
         # 重要性检测规则
         self.importance_rules = {
@@ -199,6 +203,7 @@ class MiniLociProvider:
                 importance INTEGER DEFAULT 1,
                 tags TEXT,
                 metadata TEXT,
+                trace_id TEXT,
                 vector BLOB,
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
@@ -252,6 +257,15 @@ class MiniLociProvider:
         if version < 4 or self._fts_needs_rebuild():
             self._rebuild_fts_index()
             version = max(version, 4)
+
+        if version < 5:
+            # v4 -> v5: 为每条 turn 增加稳定 trace_id，供 L1/L2/L3 摘要追溯到底层原文。
+            try:
+                self._db.execute("ALTER TABLE turns ADD COLUMN trace_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            self._db.execute("UPDATE turns SET trace_id = 'turn-' || id WHERE trace_id IS NULL OR trace_id = ''")
+            version = 5
         
         self._db.execute(f"PRAGMA user_version = {version}")
 
@@ -741,6 +755,80 @@ class MiniLociProvider:
 
         return {"updated": updated, "scanned": len(rows), "backend": self._vector_backend}
     
+    def _mark_degraded(self, component: str, error: Exception):
+        """记录非致命降级状态，避免召回路径静默失败。"""
+        message = str(error)
+        now = time.time()
+        if component == "vector":
+            self._last_vector_error = message
+            self._last_vector_error_time = now
+        elif component == "fts":
+            self._last_fts_error = message
+            self._last_fts_error_time = now
+
+    def health_status(self) -> Dict[str, Any]:
+        """返回 MiniLoci 当前健康状态，供诊断/系统提示使用。"""
+        return {
+            "provider": self.name,
+            "db_path": str(getattr(self, "db_path", "")),
+            "window_days": getattr(self, "window_days", None),
+            "enable_vector": getattr(self, "enable_vector", False),
+            "vector_backend": getattr(self, "_vector_backend", None),
+            "vector_count": self._vector_count() if hasattr(self, "_vector_ids") else 0,
+            "vector_queue_size": self._vector_queue.qsize() if hasattr(self, "_vector_queue") else 0,
+            "last_vector_error": getattr(self, "_last_vector_error", None),
+            "last_fts_error": getattr(self, "_last_fts_error", None),
+            "degraded": bool(getattr(self, "_last_vector_error", None) or getattr(self, "_last_fts_error", None)),
+        }
+
+    def _attach_trace_metadata(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """给搜索结果补齐可追溯元数据。"""
+        turn_id = data.get('id')
+        if turn_id is not None:
+            data.setdefault('trace_id', f"turn-{turn_id}")
+            data.setdefault('source_turn_ids', [turn_id])
+        if 'source_session_id' not in data and turn_id is not None:
+            row = self._db.execute("SELECT session_id, trace_id FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            if row:
+                data['source_session_id'] = row[0]
+                data['trace_id'] = row[1] or data.get('trace_id') or f"turn-{turn_id}"
+        elif 'session_id' in data:
+            data.setdefault('source_session_id', data.get('session_id'))
+        return data
+
+    def _rrf_merge_ranked_results(self, fts_results: List[Dict], vec_results: List[Dict], limit: int = 5, *, k: int = 60) -> List[Dict]:
+        """用 Reciprocal Rank Fusion 合并 FTS/LIKE 与向量 ranked list。
+
+        RRF 只依赖各检索器内部排名，不依赖原始分数尺度；同一条记录同时被
+        FTS 与向量命中时会累加得分，从而自然优先。
+        """
+        merged: Dict[Any, Dict[str, Any]] = {}
+
+        def add_ranked(items: List[Dict], source: str):
+            for rank, item in enumerate(items):
+                item_id = item.get('id')
+                if item_id is None:
+                    continue
+                score = 1.0 / (k + rank + 1)
+                if item_id not in merged:
+                    merged[item_id] = {
+                        'rrf': 0.0,
+                        'sources': [],
+                        'data': item.copy()
+                    }
+                merged[item_id]['rrf'] += score
+                if source not in merged[item_id]['sources']:
+                    merged[item_id]['sources'].append(source)
+                # 优先保留含完整内容的 FTS/LIKE 数据；vector 结果通常只有 id/score。
+                if source == 'fts' or 'content' not in merged[item_id]['data']:
+                    merged[item_id]['data'].update(item)
+
+        add_ranked(fts_results, 'fts')
+        add_ranked(vec_results, 'vector')
+
+        ranked = sorted(merged.values(), key=lambda x: x['rrf'], reverse=True)
+        return ranked[:limit]
+
     def _vector_search(self, query_vec: list, limit: int = 10) -> List[Dict]:
         """向量搜索：优先 Faiss；无 Faiss 时使用 numpy 矩阵乘法。"""
         if not query_vec:
@@ -1097,13 +1185,20 @@ class MiniLociProvider:
             (session_id, time.time())
         )
         
-        # 保存用户消息
+        # 保存用户消息；先插入再用 rowid 派生稳定 trace_id，保证可回溯且不依赖外部 UUID。
         cursor = self._db.execute(
             """INSERT INTO turns (session_id, timestamp, role, content, importance, tags, metadata)
             VALUES (?, ?, 'user', ?, ?, ?, ?)""",
             (session_id, time.time(), user_content, importance, json.dumps(tags), json.dumps(metadata))
         )
         user_rowid = cursor.lastrowid
+        user_trace_id = f"turn-{user_rowid}"
+        user_metadata = dict(metadata)
+        user_metadata["trace_id"] = user_trace_id
+        self._db.execute(
+            "UPDATE turns SET trace_id = ?, metadata = ? WHERE id = ?",
+            (user_trace_id, json.dumps(user_metadata), user_rowid)
+        )
         
         # 保存助手消息
         cursor = self._db.execute(
@@ -1112,6 +1207,13 @@ class MiniLociProvider:
             (session_id, time.time(), assistant_content, importance, json.dumps(tags), json.dumps(metadata))
         )
         asst_rowid = cursor.lastrowid
+        asst_trace_id = f"turn-{asst_rowid}"
+        asst_metadata = dict(metadata)
+        asst_metadata["trace_id"] = asst_trace_id
+        self._db.execute(
+            "UPDATE turns SET trace_id = ?, metadata = ? WHERE id = ?",
+            (asst_trace_id, json.dumps(asst_metadata), asst_rowid)
+        )
         
         # 同步FTS：写入 Python 预分词 token soup，避免依赖 native 中文 tokenizer。
         try:
@@ -1256,7 +1358,7 @@ class MiniLociProvider:
             
             # 加回时间过滤，只搜索窗口期内的记录
             rows = self._db.execute("""
-                SELECT t.id, t.content, t.role, t.timestamp, t.importance, t.tags
+                SELECT t.id, t.content, t.role, t.timestamp, t.importance, t.tags, t.session_id, t.trace_id
                 FROM turns_fts
                 JOIN turns t ON turns_fts.rowid = t.id
                 WHERE turns_fts MATCH ? AND t.timestamp > ?
@@ -1272,10 +1374,14 @@ class MiniLociProvider:
                     'timestamp': row[3],
                     'importance': row[4],
                     'tags': json.loads(row[5]) if row[5] else [],
+                    'source_session_id': row[6],
+                    'trace_id': row[7] or f"turn-{row[0]}",
+                    'source_turn_ids': [row[0]],
                     'fts_score': 0.8
                 })
         except Exception as e:
             logger.debug(f"FTS search failed: {e}")
+            self._mark_degraded("fts", e)
             # 降级到 LIKE 查询：使用清洗后的关键词/同义词，而不是原始“你还记得...”整句。
             try:
                 like_keywords = self._search_terms(self._strip_recall_triggers(query), expand_synonyms=True)[:12]
@@ -1285,7 +1391,7 @@ class MiniLociProvider:
                     clauses = " OR ".join(["content LIKE ?" for _ in like_keywords])
                     params = [f"%{kw}%" for kw in like_keywords]
                     rows = self._db.execute(f"""
-                        SELECT id, content, role, timestamp, importance, tags
+                        SELECT id, content, role, timestamp, importance, tags, session_id, trace_id
                         FROM turns
                         WHERE ({clauses}) AND timestamp > ?
                         ORDER BY importance DESC, timestamp DESC
@@ -1302,10 +1408,14 @@ class MiniLociProvider:
                         'timestamp': row[3],
                         'importance': row[4],
                         'tags': json.loads(row[5]) if row[5] else [],
+                        'source_session_id': row[6],
+                        'trace_id': row[7] or f"turn-{row[0]}",
+                        'source_turn_ids': [row[0]],
                         'fts_score': 0.5
                     })
             except Exception as e2:
                 logger.debug(f"LIKE fallback failed: {e2}")
+                self._mark_degraded("fts", e2)
         
         # 向量搜索：Faiss 可选；numpy backend 只要内存矩阵有数据即可搜索。
         vec_results = []
@@ -1316,65 +1426,42 @@ class MiniLociProvider:
                     vec_results = self._vector_search(query_vec, limit * 3)
             except Exception as e:
                 logger.debug(f"Vector search failed: {e}")
+                self._mark_degraded("vector", e)
         
-        # 合并排序
-        combined = {}
-        
-        # FTS分数归一化
-        if fts_results:
-            for r in fts_results:
-                combined[r['id']] = {
-                    'fts': r['fts_score'],
-                    'vec': 0,
-                    'data': r
-                }
-        
-        # 向量分数归一化
-        if vec_results:
-            max_vec = max(r['score'] for r in vec_results) if vec_results else 1.0
-            for r in vec_results:
-                normalized = r['score'] / max_vec if max_vec > 0 else 0.0
-                if r['id'] in combined:
-                    combined[r['id']]['vec'] = normalized
-                else:
-                    row = self._db.execute(
-                        "SELECT content, role, timestamp, importance, tags FROM turns WHERE id = ?",
-                        (r['id'],)
-                    ).fetchone()
-                    if row:
-                        combined[r['id']] = {
-                            'fts': 0,
-                            'vec': normalized,
-                            'data': {
-                                'id': r['id'],
-                                'content': row[0],
-                                'role': row[1],
-                                'timestamp': row[2],
-                                'importance': row[3],
-                                'tags': json.loads(row[4]) if row[4] else []
-                            }
-                        }
-        
-        # 加权计算
-        for item in combined.values():
+        # RRF 合并排序：FTS/LIKE 与向量各自产生 ranked list，避免依赖不同检索器的原始分数尺度。
+        merged = self._rrf_merge_ranked_results(fts_results, vec_results, limit=limit * 3)
+
+        # 向量结果通常只有 id/score，需要补齐 turns 原文数据。
+        enriched = []
+        for item in merged:
             data = item['data']
+            if 'content' not in data:
+                row = self._db.execute(
+                    "SELECT content, role, timestamp, importance, tags, session_id, trace_id FROM turns WHERE id = ?",
+                    (data['id'],)
+                ).fetchone()
+                if not row:
+                    continue
+                data.update({
+                    'content': row[0],
+                    'role': row[1],
+                    'timestamp': row[2],
+                    'importance': row[3],
+                    'tags': json.loads(row[4]) if row[4] else [],
+                    'source_session_id': row[5],
+                    'trace_id': row[6] or f"turn-{data['id']}",
+                    'source_turn_ids': [data['id']]
+                })
+            self._attach_trace_metadata(data)
+            data['search_sources'] = item.get('sources', [])
+            data['rrf_score'] = item.get('rrf', 0.0)
             time_weight = self._calc_time_weight(data['timestamp'])
-            importance = data['importance']
-            
-            item['total'] = (
-                item['fts'] * self.fts_weight +
-                item['vec'] * self.vector_weight +
-                time_weight * 0.15 +
-                (importance / 3.0) * 0.15
-            )
-        
-        # 排序返回
-        sorted_results = sorted(
-            combined.values(),
-            key=lambda x: x['total'],
-            reverse=True
-        )
-        
+            importance = data.get('importance', 1)
+            # RRF 为主；时间和重要性只作为轻量稳定偏置，避免旧的分数尺度问题回流。
+            item['total'] = item.get('rrf', 0.0) + time_weight * 0.003 + (importance / 3.0) * 0.003
+            enriched.append(item)
+
+        sorted_results = sorted(enriched, key=lambda x: x['total'], reverse=True)
         return [r['data'] for r in sorted_results[:limit]]
 
     def _calc_time_weight(self, timestamp: float) -> float:

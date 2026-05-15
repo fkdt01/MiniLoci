@@ -315,6 +315,77 @@ class TestMiniLoci:
         results = provider._hybrid_search("你还记得部署方案吗？")
         assert results
         assert any("Docker" in r["content"] or "部署" in r["content"] for r in results)
+
+    def test_rrf_merge_rewards_results_that_appear_in_multiple_ranked_lists(self, provider):
+        """RRF 融合应基于排名，优先奖励同时被 FTS 与向量召回的结果。"""
+        fts_results = [
+            {"id": 1, "content": "fts-only", "timestamp": time.time(), "importance": 1},
+            {"id": 2, "content": "both", "timestamp": time.time(), "importance": 1},
+        ]
+        vec_results = [
+            {"id": 2, "score": 0.2},
+            {"id": 3, "score": 0.99},
+        ]
+
+        merged = provider._rrf_merge_ranked_results(fts_results, vec_results, limit=3)
+
+        assert [item["data"]["id"] for item in merged] == [2, 1, 3]
+        assert merged[0]["rrf"] > merged[1]["rrf"]
+        assert merged[0]["sources"] == ["fts", "vector"]
+
+    def test_sync_turn_writes_stable_trace_ids(self, provider):
+        """每条 turn 必须有稳定 trace_id，为 L1/L2 摘要回溯到底层原文打基础。"""
+        provider.sync_turn("记住这个 MiniLoci 配置", "已记录", session_id="trace-session")
+
+        rows = provider._db.execute(
+            "SELECT id, trace_id, metadata FROM turns WHERE session_id = ? ORDER BY id",
+            ("trace-session",)
+        ).fetchall()
+
+        assert len(rows) == 2
+        for row_id, trace_id, metadata_json in rows:
+            assert trace_id == f"turn-{row_id}"
+            metadata = json.loads(metadata_json)
+            assert metadata["trace_id"] == trace_id
+
+    def test_search_results_include_trace_metadata(self, provider):
+        """搜索结果应暴露 trace_id/session/source_turn_ids，方便后续下钻查证。"""
+        provider.sync_turn(
+            "我们决定用Docker部署MiniLoci",
+            "部署方案已记录",
+            session_id="trace-session"
+        )
+
+        results = provider._hybrid_search("你还记得部署方案吗？")
+
+        assert results
+        first = results[0]
+        assert first["trace_id"].startswith("turn-")
+        assert first["source_turn_ids"] == [first["id"]]
+        assert first["source_session_id"] == "trace-session"
+
+    def test_vector_recall_failure_marks_degraded_but_keeps_fts_results(self, provider, monkeypatch):
+        """向量召回失败不能阻断 FTS 结果，并应在健康状态中标记 degraded。"""
+        provider.sync_turn(
+            "我们决定用Docker部署MiniLoci",
+            "部署方案已记录",
+            session_id="trace-session"
+        )
+        provider.enable_vector = True
+        provider._vector_matrix = np.ones((1, provider._vector_dimension), dtype=np.float32)
+        provider._vector_ids = [1]
+
+        def boom(_query):
+            raise RuntimeError("embedding backend unavailable")
+
+        monkeypatch.setattr(provider, "_embed", boom)
+
+        results = provider._hybrid_search("你还记得部署方案吗？")
+        health = provider.health_status()
+
+        assert results
+        assert health["degraded"] is True
+        assert health["last_vector_error"] == "embedding backend unavailable"
     
     def test_config_schema(self, provider):
         """测试配置Schema"""
