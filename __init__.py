@@ -1597,33 +1597,84 @@ class MiniLociProvider:
 
     def _find_similar_atom(self, atom_type: str, content: str) -> Optional[int]:
         """用 FTS/LIKE 查找同类型近似 atom，避免重复写入。"""
+        decision = self._decide_atom_conflict({"type": atom_type, "content": content, "priority": 50})
+        return decision.get("target_id")
+
+    def _token_overlap_ratio(self, left: str, right: str) -> float:
+        """计算轻量 token overlap，供规则版 conflict detection 使用。"""
+        left_terms = set(self._search_terms(left, expand_synonyms=False))
+        right_terms = set(self._search_terms(right, expand_synonyms=False))
+        if not left_terms or not right_terms:
+            return 0.0
+        return len(left_terms & right_terms) / max(1, min(len(left_terms), len(right_terms)))
+
+    def _candidate_atoms_for_conflict(self, atom_type: str, content: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """召回同类型候选 atom，供 store/update/merge/discard 判断。"""
         terms = self._atom_similarity_terms(content)
         if not terms:
-            return None
+            return []
         fts_query = " OR ".join(terms)
         try:
-            row = self._db.execute("""
-                SELECT a.id
+            rows = self._db.execute("""
+                SELECT a.id, a.content, a.type, a.priority, a.source_turn_ids, a.trace_ids,
+                       a.source_session_id, a.scene_name, a.metadata, a.created_at, a.updated_at
                 FROM memory_atoms_fts f
                 JOIN memory_atoms a ON f.rowid = a.id
                 WHERE memory_atoms_fts MATCH ? AND a.type = ?
                 ORDER BY rank
-                LIMIT 1
-            """, (fts_query, atom_type)).fetchone()
-            if row:
-                return int(row[0])
+                LIMIT ?
+            """, (fts_query, atom_type, limit)).fetchall()
+            candidates = [self._format_atom_row(row) for row in rows]
+            if candidates:
+                return candidates
         except Exception:
             pass
 
         clauses = " OR ".join(["content LIKE ?" for _ in terms[:8]])
         try:
-            row = self._db.execute(
-                f"SELECT id FROM memory_atoms WHERE type = ? AND ({clauses}) ORDER BY updated_at DESC LIMIT 1",
-                (atom_type, *[f"%{t}%" for t in terms[:8]])
-            ).fetchone()
-            return int(row[0]) if row else None
+            rows = self._db.execute(f"""
+                SELECT id, content, type, priority, source_turn_ids, trace_ids,
+                       source_session_id, scene_name, metadata, created_at, updated_at
+                FROM memory_atoms
+                WHERE type = ? AND ({clauses})
+                ORDER BY updated_at DESC
+                LIMIT ?
+            """, (atom_type, *[f"%{t}%" for t in terms[:8]], limit)).fetchall()
+            return [self._format_atom_row(row) for row in rows]
         except Exception:
-            return None
+            return []
+
+    def _decide_atom_conflict(self, atom: Dict[str, Any]) -> Dict[str, Any]:
+        """规则版 L1 conflict detection：store/update/merge/discard。"""
+        candidates = self._candidate_atoms_for_conflict(atom["type"], atom["content"], limit=5)
+        if not candidates:
+            return {"action": "store", "target_id": None, "score": 0.0}
+
+        scored = [
+            (self._token_overlap_ratio(atom["content"], candidate["content"]), candidate)
+            for candidate in candidates
+        ]
+        score, candidate = max(scored, key=lambda item: item[0])
+        shared_core_markers = ["Docker", "MiniLoci", "Hermes", "部署", "配置", "方案", "CI", "CD", "GitHub", "Actions"]
+        shared_core = [marker for marker in shared_core_markers if marker in atom["content"] and marker in candidate["content"]]
+        if score < 0.45 and len(shared_core) < 2:
+            return {"action": "store", "target_id": None, "score": score}
+        if score < 0.45 and len(shared_core) >= 2:
+            # 中文滑窗 token overlap 对“同一项目事实的不同措辞”偏保守；多个核心实体/动作重合时仍视为候选冲突。
+            score = max(score, 0.45)
+
+        new_priority = int(atom.get("priority", 50))
+        old_priority = int(candidate.get("priority", 50))
+        new_content = atom["content"]
+        old_content = candidate["content"]
+
+        if new_content == old_content:
+            return {"action": "merge", "target_id": candidate["id"], "score": score}
+        if len(new_content) <= len(old_content) and new_priority <= old_priority:
+            return {"action": "discard", "target_id": candidate["id"], "score": score}
+        if len(new_content) > len(old_content) + 8 or new_priority > old_priority:
+            return {"action": "update", "target_id": candidate["id"], "score": score}
+        return {"action": "merge", "target_id": candidate["id"], "score": score}
 
     def _sync_atom_fts(self, atom_id: int, content: str, atom_type: str, scene_name: str):
         try:
@@ -1638,10 +1689,13 @@ class MiniLociProvider:
 
     def _upsert_memory_atom(self, atom: Dict[str, Any], session_id: str, source_turn_ids: List[int], trace_ids: List[str]):
         now = time.time()
-        existing_id = self._find_similar_atom(atom["type"], atom["content"])
+        decision = self._decide_atom_conflict(atom)
+        existing_id = decision.get("target_id")
         if existing_id:
+            if decision.get("action") == "discard":
+                return
             row = self._db.execute(
-                "SELECT source_turn_ids, trace_ids, content, priority, scene_name FROM memory_atoms WHERE id = ?",
+                "SELECT source_turn_ids, trace_ids, content, priority, scene_name, metadata FROM memory_atoms WHERE id = ?",
                 (existing_id,)
             ).fetchone()
             if not row:
@@ -1651,10 +1705,15 @@ class MiniLociProvider:
             for trace_id in json.loads(row[1] or "[]") + trace_ids:
                 if trace_id not in merged_trace_ids:
                     merged_trace_ids.append(trace_id)
-            content = row[2] if len(row[2]) >= len(atom["content"]) else atom["content"]
+            action = decision.get("action") or "merge"
+            if action == "update":
+                content = atom["content"]
+                metadata = {"dedup": "updated", "updated_from_turn_ids": source_turn_ids, "conflict_score": decision.get("score")}
+            else:
+                content = row[2] if len(row[2]) >= len(atom["content"]) else atom["content"]
+                metadata = {"dedup": "merged", "updated_from_turn_ids": source_turn_ids, "conflict_score": decision.get("score")}
             priority = max(int(row[3] or 0), int(atom.get("priority", 50)))
-            scene_name = row[4] or atom.get("scene_name")
-            metadata = {"dedup": "merged", "updated_from_turn_ids": source_turn_ids}
+            scene_name = atom.get("scene_name") or row[4]
             self._db.execute("""
                 UPDATE memory_atoms
                 SET content = ?, priority = ?, source_turn_ids = ?, trace_ids = ?, scene_name = ?, metadata = ?, updated_at = ?
@@ -1919,24 +1978,41 @@ class MiniLociProvider:
     
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         """暴露搜索工具"""
-        return [{
-            "name": "miniloci_search",
-            "description": "搜索MiniLoci记忆库中的历史对话",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "days": {"type": "integer", "description": "搜索最近N天", "default": 3},
-                    "limit": {"type": "integer", "description": "返回条数", "default": 5}
-                },
-                "required": ["query"]
+        return [
+            {
+                "name": "miniloci_search",
+                "description": "搜索MiniLoci记忆库中的历史对话",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词"},
+                        "days": {"type": "integer", "description": "搜索最近N天", "default": 3},
+                        "limit": {"type": "integer", "description": "返回条数", "default": 5}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "miniloci_search_atoms",
+                "description": "搜索 MiniLoci L1 结构化记忆 atoms（偏好、项目事实、故障经验），结果带 source_turn_ids 可追溯",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词"},
+                        "type": {"type": "string", "description": "可选 atom 类型：instruction/project/incident", "default": ""},
+                        "limit": {"type": "integer", "description": "返回条数", "default": 5}
+                    },
+                    "required": ["query"]
+                }
             }
-        }]
+        ]
     
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any]) -> str:
         """处理工具调用"""
         if tool_name == "miniloci_search":
             return self._tool_search(args)
+        if tool_name == "miniloci_search_atoms":
+            return self._tool_search_atoms(args)
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
     def _tool_search(self, args: Dict[str, Any]) -> str:
@@ -1974,6 +2050,33 @@ class MiniLociProvider:
             }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"query": query, "fts_query": fts_query, "error": str(e)}, ensure_ascii=False)
+
+    def _tool_search_atoms(self, args: Dict[str, Any]) -> str:
+        """结构化 L1 atoms 搜索工具。"""
+        query = args.get("query", "")
+        limit = args.get("limit", 5)
+        atom_type = args.get("type") or args.get("atom_type") or None
+        try:
+            atoms = self.search_atoms(query, limit=limit, atom_type=atom_type)
+            return json.dumps({
+                "query": query,
+                "type": atom_type,
+                "results": [
+                    {
+                        "id": atom["id"],
+                        "type": atom["type"],
+                        "content": atom["content"],
+                        "priority": atom["priority"],
+                        "source_turn_ids": atom["source_turn_ids"],
+                        "trace_ids": atom["trace_ids"],
+                        "source_session_id": atom["source_session_id"],
+                        "scene_name": atom["scene_name"],
+                    }
+                    for atom in atoms
+                ]
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"query": query, "type": atom_type, "error": str(e)}, ensure_ascii=False)
     
     def on_session_end(self, messages: List[Dict[str, Any]]):
         """会话结束标记"""

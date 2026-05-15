@@ -431,6 +431,71 @@ class TestMiniLoci:
         assert len(deployment_atoms) == 1
         assert "Docker" in deployment_atoms[0]["content"]
         assert len(deployment_atoms[0]["source_turn_ids"]) >= 2
+
+    def test_atom_conflict_detection_discards_low_value_duplicate_instruction(self, provider):
+        """更弱的重复 instruction 应 discard，不覆盖已有更完整 atom。"""
+        existing = {
+            "type": "instruction",
+            "content": "用户要求 AI 以后回答时：以后回答不要用表格，要用纯文字和 emoji bullet",
+            "priority": 90,
+            "scene_name": "用户沟通偏好",
+        }
+        provider._upsert_memory_atom(existing, "s1", [1, 2], ["turn-1", "turn-2"])
+
+        weaker = {
+            "type": "instruction",
+            "content": "用户要求 AI 以后回答时：以后不要用表格",
+            "priority": 70,
+            "scene_name": "用户沟通偏好",
+        }
+        decision = provider._decide_atom_conflict(weaker)
+        provider._upsert_memory_atom(weaker, "s1", [3, 4], ["turn-3", "turn-4"])
+
+        atoms = provider.search_atoms("表格 emoji", limit=10, atom_type="instruction")
+
+        assert decision["action"] == "discard"
+        assert len(atoms) == 1
+        assert "emoji" in atoms[0]["content"]
+        assert atoms[0]["source_turn_ids"] == [1, 2]
+
+    def test_atom_conflict_detection_updates_more_specific_project_atom(self, provider):
+        """更具体的新 project atom 应 update 旧 atom，并保留旧 source。"""
+        provider._upsert_memory_atom(
+            {"type": "project", "content": "项目事实：MiniLoci 使用 Docker 部署", "priority": 60, "scene_name": "MiniLoci 记忆系统"},
+            "s1", [1, 2], ["turn-1", "turn-2"]
+        )
+        richer = {
+            "type": "project",
+            "content": "项目事实：MiniLoci 使用 Docker 部署，并通过 GitHub Actions 执行 CI/CD 发布流程",
+            "priority": 80,
+            "scene_name": "MiniLoci 记忆系统",
+        }
+        decision = provider._decide_atom_conflict(richer)
+        provider._upsert_memory_atom(richer, "s1", [3, 4], ["turn-3", "turn-4"])
+
+        atoms = provider.search_atoms("GitHub Actions CI/CD", limit=10, atom_type="project")
+
+        assert decision["action"] == "update"
+        assert len(atoms) == 1
+        assert "GitHub Actions" in atoms[0]["content"]
+        assert atoms[0]["source_turn_ids"] == [1, 2, 3, 4]
+        assert atoms[0]["metadata"]["dedup"] == "updated"
+
+    def test_miniloci_search_atoms_tool_schema_and_handler(self, provider):
+        """插件应暴露结构化 atom 搜索工具，区别于原始 turns 搜索。"""
+        provider.sync_turn(
+            "以后回答不要用表格，要用纯文字和 emoji bullet",
+            "收到，以后会避免表格",
+            session_id="atom-session"
+        )
+
+        tool_names = [schema["name"] for schema in provider.get_tool_schemas()]
+        payload = json.loads(provider.handle_tool_call("miniloci_search_atoms", {"query": "表格 emoji", "type": "instruction", "limit": 5}))
+
+        assert "miniloci_search_atoms" in tool_names
+        assert payload["results"]
+        assert payload["results"][0]["type"] == "instruction"
+        assert payload["results"][0]["source_turn_ids"]
     
     def test_config_schema(self, provider):
         """测试配置Schema"""

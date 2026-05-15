@@ -288,6 +288,16 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.3.0 (2026-05-15)
+
+**增强 L1 atoms 去重/冲突检测与工具访问：**
+- 新增规则版 `_decide_atom_conflict()`，支持 `store / update / merge / discard` 决策
+- 重复但更弱的 instruction 会 discard，不覆盖更完整偏好
+- 更具体的 project atom 会 update 旧 atom，同时合并 `source_turn_ids` 与 `trace_ids`
+- 中文项目事实冲突检测增加核心实体/动作重合判断，减少同义改写导致的重复 atom
+- 新增 `miniloci_search_atoms` 工具 schema 与 handler，可直接搜索结构化 atoms
+- 完整测试扩展到 40 项，覆盖 discard/update/tool handler 回归
+
 ### v1.2.0 (2026-05-15)
 
 **新增 L1 memory_atoms 结构化记忆层：**
