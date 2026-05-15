@@ -239,11 +239,32 @@ class MiniLociProvider:
                 content_rowid='id'
             );
             
+            CREATE TABLE IF NOT EXISTS scene_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scene_name TEXT NOT NULL UNIQUE,
+                summary TEXT NOT NULL,
+                atom_ids TEXT NOT NULL,
+                source_turn_ids TEXT NOT NULL,
+                trace_ids TEXT NOT NULL,
+                metadata TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS scene_blocks_fts USING fts5(
+                scene_name,
+                summary,
+                tokenize='unicode61',
+                content='scene_blocks',
+                content_rowid='id'
+            );
+            
             CREATE INDEX IF NOT EXISTS idx_turns_time ON turns(timestamp);
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
             CREATE INDEX IF NOT EXISTS idx_turns_importance ON turns(importance);
             CREATE INDEX IF NOT EXISTS idx_atoms_type ON memory_atoms(type);
             CREATE INDEX IF NOT EXISTS idx_atoms_session ON memory_atoms(source_session_id);
+            CREATE INDEX IF NOT EXISTS idx_scene_name ON scene_blocks(scene_name);
             CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
         """)
         
@@ -296,6 +317,11 @@ class MiniLociProvider:
             # v5 -> v6: 创建轻量 L1 memory_atoms 结构化记忆层。
             self._create_memory_atoms_tables()
             version = 6
+
+        if version < 7:
+            # v6 -> v7: 创建 L2 scene_blocks 场景记忆层。
+            self._create_scene_blocks_tables()
+            version = 7
         
         self._db.execute(f"PRAGMA user_version = {version}")
 
@@ -337,6 +363,30 @@ class MiniLociProvider:
             );
             CREATE INDEX IF NOT EXISTS idx_atoms_type ON memory_atoms(type);
             CREATE INDEX IF NOT EXISTS idx_atoms_session ON memory_atoms(source_session_id);
+        """)
+
+    def _create_scene_blocks_tables(self):
+        """创建 L2 场景记忆表与 FTS 索引。"""
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS scene_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scene_name TEXT NOT NULL UNIQUE,
+                summary TEXT NOT NULL,
+                atom_ids TEXT NOT NULL,
+                source_turn_ids TEXT NOT NULL,
+                trace_ids TEXT NOT NULL,
+                metadata TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS scene_blocks_fts USING fts5(
+                scene_name,
+                summary,
+                tokenize='unicode61',
+                content='scene_blocks',
+                content_rowid='id'
+            );
+            CREATE INDEX IF NOT EXISTS idx_scene_name ON scene_blocks(scene_name);
         """)
 
     def _fts_needs_rebuild(self) -> bool:
@@ -1729,6 +1779,7 @@ class MiniLociProvider:
                 existing_id,
             ))
             self._sync_atom_fts(existing_id, content, atom["type"], scene_name or "")
+            self._upsert_scene_block(scene_name or atom.get("type", "default"))
             return
 
         cursor = self._db.execute("""
@@ -1747,6 +1798,128 @@ class MiniLociProvider:
             now,
         ))
         self._sync_atom_fts(cursor.lastrowid, atom["content"], atom["type"], atom.get("scene_name") or "")
+        self._upsert_scene_block(atom.get("scene_name") or atom.get("type", "default"))
+
+    def _scene_summary_from_atoms(self, scene_name: str, atoms: List[Dict[str, Any]]) -> str:
+        """根据 atoms 生成可追溯、规则版 scene summary。"""
+        lines = [f"场景：{scene_name}"]
+        for atom in atoms[:8]:
+            lines.append(f"- [{atom['type']}] {atom['content']}")
+        return "\n".join(lines)
+
+    def _sync_scene_fts(self, scene_id: int, scene_name: str, summary: str):
+        try:
+            self._db.execute(
+                "INSERT OR REPLACE INTO scene_blocks_fts (rowid, scene_name, summary) VALUES (?, ?, ?)",
+                (scene_id, self._tokenize_for_fts(scene_name), self._tokenize_for_fts(summary))
+            )
+        except Exception as e:
+            logger.debug(f"Scene FTS sync failed: {e}")
+
+    def _upsert_scene_block(self, scene_name: str):
+        """把同一 scene_name 下的 atoms 聚合成 L2 scene block。"""
+        if not scene_name:
+            return
+        rows = self._db.execute("""
+            SELECT id, content, type, priority, source_turn_ids, trace_ids,
+                   source_session_id, scene_name, metadata, created_at, updated_at
+            FROM memory_atoms
+            WHERE scene_name = ?
+            ORDER BY priority DESC, updated_at DESC
+        """, (scene_name,)).fetchall()
+        atoms = [self._format_atom_row(row) for row in rows]
+        if not atoms:
+            return
+
+        atom_ids = [atom["id"] for atom in atoms]
+        source_turn_ids = sorted({tid for atom in atoms for tid in atom.get("source_turn_ids", [])})
+        trace_ids = []
+        for atom in atoms:
+            for trace_id in atom.get("trace_ids", []):
+                if trace_id not in trace_ids:
+                    trace_ids.append(trace_id)
+        summary = self._scene_summary_from_atoms(scene_name, atoms)
+        now = time.time()
+        metadata = {"builder": "rules-v1", "atom_count": len(atoms)}
+        existing = self._db.execute("SELECT id, created_at FROM scene_blocks WHERE scene_name = ?", (scene_name,)).fetchone()
+        if existing:
+            scene_id = existing[0]
+            self._db.execute("""
+                UPDATE scene_blocks
+                SET summary = ?, atom_ids = ?, source_turn_ids = ?, trace_ids = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+            """, (
+                summary,
+                json.dumps(atom_ids),
+                json.dumps(source_turn_ids),
+                json.dumps(trace_ids),
+                json.dumps(metadata, ensure_ascii=False),
+                now,
+                scene_id,
+            ))
+        else:
+            cursor = self._db.execute("""
+                INSERT INTO scene_blocks (scene_name, summary, atom_ids, source_turn_ids, trace_ids, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                scene_name,
+                summary,
+                json.dumps(atom_ids),
+                json.dumps(source_turn_ids),
+                json.dumps(trace_ids),
+                json.dumps(metadata, ensure_ascii=False),
+                now,
+                now,
+            ))
+            scene_id = cursor.lastrowid
+        self._sync_scene_fts(scene_id, scene_name, summary)
+
+    def _format_scene_row(self, row) -> Dict[str, Any]:
+        return {
+            "id": row[0],
+            "scene_name": row[1],
+            "summary": row[2],
+            "atom_ids": json.loads(row[3] or "[]"),
+            "source_turn_ids": json.loads(row[4] or "[]"),
+            "trace_ids": json.loads(row[5] or "[]"),
+            "metadata": json.loads(row[6] or "{}"),
+            "created_at": row[7],
+            "updated_at": row[8],
+        }
+
+    def search_scenes(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """搜索 L2 场景记忆 blocks。"""
+        terms = self._search_terms(query, expand_synonyms=True)
+        if not terms:
+            return []
+        fts_query = " OR ".join(terms)
+        try:
+            rows = self._db.execute("""
+                SELECT s.id, s.scene_name, s.summary, s.atom_ids, s.source_turn_ids,
+                       s.trace_ids, s.metadata, s.created_at, s.updated_at
+                FROM scene_blocks_fts f
+                JOIN scene_blocks s ON f.rowid = s.id
+                WHERE scene_blocks_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """, (fts_query, limit)).fetchall()
+            return [self._format_scene_row(row) for row in rows]
+        except Exception as e:
+            self._mark_degraded("fts", e)
+            clauses = " OR ".join(["summary LIKE ? OR scene_name LIKE ?" for _ in terms[:8]])
+            params = []
+            for term in terms[:8]:
+                params.extend([f"%{term}%", f"%{term}%"])
+            params.append(limit)
+            rows = self._db.execute(f"""
+                SELECT id, scene_name, summary, atom_ids, source_turn_ids,
+                       trace_ids, metadata, created_at, updated_at
+                FROM scene_blocks
+                WHERE {clauses}
+                ORDER BY updated_at DESC
+                LIMIT ?
+            """, tuple(params)).fetchall()
+            return [self._format_scene_row(row) for row in rows]
 
     def _extract_and_store_atoms(self, session_id: str, user_msg: str, assistant_msg: str, user_rowid: int, asst_rowid: int, trace_ids: List[str], importance: int, tags: List[str]):
         atoms = self._extract_atoms_from_turn(user_msg, assistant_msg, importance, tags)
@@ -2004,6 +2177,18 @@ class MiniLociProvider:
                     },
                     "required": ["query"]
                 }
+            },
+            {
+                "name": "miniloci_search_scenes",
+                "description": "搜索 MiniLoci L2 场景记忆 blocks，返回聚合摘要及可追溯 source_turn_ids",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索关键词"},
+                        "limit": {"type": "integer", "description": "返回条数", "default": 5}
+                    },
+                    "required": ["query"]
+                }
             }
         ]
     
@@ -2013,6 +2198,8 @@ class MiniLociProvider:
             return self._tool_search(args)
         if tool_name == "miniloci_search_atoms":
             return self._tool_search_atoms(args)
+        if tool_name == "miniloci_search_scenes":
+            return self._tool_search_scenes(args)
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
     def _tool_search(self, args: Dict[str, Any]) -> str:
@@ -2077,6 +2264,30 @@ class MiniLociProvider:
             }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"query": query, "type": atom_type, "error": str(e)}, ensure_ascii=False)
+
+    def _tool_search_scenes(self, args: Dict[str, Any]) -> str:
+        """L2 场景记忆搜索工具。"""
+        query = args.get("query", "")
+        limit = args.get("limit", 5)
+        try:
+            scenes = self.search_scenes(query, limit=limit)
+            return json.dumps({
+                "query": query,
+                "results": [
+                    {
+                        "id": scene["id"],
+                        "scene_name": scene["scene_name"],
+                        "summary": scene["summary"],
+                        "atom_ids": scene["atom_ids"],
+                        "source_turn_ids": scene["source_turn_ids"],
+                        "trace_ids": scene["trace_ids"],
+                        "metadata": scene["metadata"],
+                    }
+                    for scene in scenes
+                ]
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"query": query, "error": str(e)}, ensure_ascii=False)
     
     def on_session_end(self, messages: List[Dict[str, Any]]):
         """会话结束标记"""

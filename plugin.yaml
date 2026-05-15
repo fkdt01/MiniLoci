@@ -1,5 +1,5 @@
 name: miniloci
-version: 1.3.0
+version: 1.4.0
 description: "MiniLoci - 轻量级会话记忆系统，保留3天，混合搜索(FTS5+向量)，按需召回，部署重启不丢数据"
 pip_dependencies:
   - numpy

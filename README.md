@@ -288,6 +288,16 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.4.0 (2026-05-15)
+
+**新增 L2 scene_blocks 场景记忆层：**
+- 新增 `scene_blocks` 表与 `scene_blocks_fts` 索引，DB schema 升级到 `user_version=7`
+- 同一 `scene_name` 下的 L1 atoms 自动聚合为 L2 scene block
+- scene summary 使用规则版可追溯摘要，保留 atom 类型与原始 atom 内容
+- 每个 scene 保存 `atom_ids`、`source_turn_ids`、`trace_ids`，继续保持从 L2 回溯到 L0 turns
+- 新增 `search_scenes(query, limit)` 和 `miniloci_search_scenes` 工具 schema/handler
+- 补充 3 个 L2 scene 回归测试，完整测试扩展到 43 项
+
 ### v1.3.0 (2026-05-15)
 
 **增强 L1 atoms 去重/冲突检测与工具访问：**

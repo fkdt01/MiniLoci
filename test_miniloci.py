@@ -496,6 +496,53 @@ class TestMiniLoci:
         assert payload["results"]
         assert payload["results"][0]["type"] == "instruction"
         assert payload["results"][0]["source_turn_ids"]
+
+    def test_scene_blocks_schema_created(self, provider):
+        """L2 scene_blocks 表应在初始化时创建，作为 atoms 上方的场景层。"""
+        cols = {
+            row[1] for row in provider._db.execute("PRAGMA table_info(scene_blocks)").fetchall()
+        }
+        assert {"id", "scene_name", "summary", "atom_ids", "source_turn_ids", "trace_ids", "updated_at"}.issubset(cols)
+
+    def test_project_atoms_roll_up_into_traceable_scene_block(self, provider):
+        """同一 scene 的 project atoms 应聚合为可追溯 scene block。"""
+        provider.sync_turn(
+            "我们决定用Docker部署MiniLoci",
+            "Docker 部署方案已记录",
+            session_id="scene-session"
+        )
+        provider.sync_turn(
+            "MiniLoci 使用 GitHub Actions 做 CI/CD 发布",
+            "CI/CD 流程已记录",
+            session_id="scene-session"
+        )
+
+        scenes = provider.search_scenes("MiniLoci Docker CI/CD", limit=5)
+
+        assert scenes
+        scene = scenes[0]
+        assert scene["scene_name"] == "MiniLoci 记忆系统"
+        assert "Docker" in scene["summary"]
+        assert "GitHub Actions" in scene["summary"] or "CI/CD" in scene["summary"]
+        assert len(scene["atom_ids"]) >= 1
+        assert len(scene["source_turn_ids"]) >= 2
+        assert scene["trace_ids"][0].startswith("turn-")
+
+    def test_scene_search_tool_schema_and_handler(self, provider):
+        """插件应暴露 L2 scene 搜索工具。"""
+        provider.sync_turn(
+            "我们决定用Docker部署MiniLoci",
+            "Docker 部署方案已记录",
+            session_id="scene-session"
+        )
+
+        tool_names = [schema["name"] for schema in provider.get_tool_schemas()]
+        payload = json.loads(provider.handle_tool_call("miniloci_search_scenes", {"query": "MiniLoci Docker", "limit": 3}))
+
+        assert "miniloci_search_scenes" in tool_names
+        assert payload["results"]
+        assert payload["results"][0]["scene_name"] == "MiniLoci 记忆系统"
+        assert payload["results"][0]["source_turn_ids"]
     
     def test_config_schema(self, provider):
         """测试配置Schema"""
