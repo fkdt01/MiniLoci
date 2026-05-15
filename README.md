@@ -288,6 +288,15 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.6.0 (2026-05-15)
+
+**新增历史 L1/L2 回填能力：**
+- 新增 `backfill_memory_layers(limit, since_days, dry_run)`，可从既有 `turns` 重新抽取 L1 `memory_atoms` 并滚动更新 L2 `scene_blocks`
+- 新增 `miniloci_backfill_layers` 工具 schema/handler，默认 `dry_run=true`，避免误写生产库
+- 支持 `limit` 限制扫描 turn pairs 数，支持 `since_days` 仅扫描最近 N 天
+- 回填保留 `source_turn_ids` 与 `trace_ids`，继续满足 L0→L1→L2 可追溯链路
+- 补充 3 个 backfill 回归测试，完整测试扩展到 48 项
+
 ### v1.5.0 (2026-05-15)
 
 **新增 L3 persona_candidate 候选画像层：**

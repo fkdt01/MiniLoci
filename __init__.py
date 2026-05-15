@@ -2028,6 +2028,78 @@ class MiniLociProvider:
         for atom in atoms:
             self._upsert_memory_atom(atom, session_id, [user_rowid, asst_rowid], trace_ids)
 
+    def _historical_turn_pairs(self, *, limit: Optional[int] = None, since_days: Optional[int] = None) -> List[Dict[str, Any]]:
+        """按 id 顺序把历史 user/assistant turns 组成可回填 pair。"""
+        where = []
+        params = []
+        if since_days is not None:
+            where.append("timestamp > ?")
+            params.append(time.time() - since_days * 24 * 3600)
+        sql = "SELECT id, session_id, role, content, importance, tags, trace_id, timestamp FROM turns"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY session_id, id"
+        rows = self._db.execute(sql, tuple(params)).fetchall()
+        pairs = []
+        pending_user = None
+        for row in rows:
+            item = {
+                "id": row[0],
+                "session_id": row[1],
+                "role": row[2],
+                "content": row[3],
+                "importance": row[4],
+                "tags": json.loads(row[5]) if row[5] else [],
+                "trace_id": row[6] or f"turn-{row[0]}",
+                "timestamp": row[7],
+            }
+            if item["role"] == "user":
+                pending_user = item
+            elif item["role"] == "assistant" and pending_user and pending_user["session_id"] == item["session_id"]:
+                pairs.append({"user": pending_user, "assistant": item})
+                pending_user = None
+                if limit is not None and len(pairs) >= int(limit):
+                    break
+        return pairs
+
+    def backfill_memory_layers(self, *, limit: Optional[int] = None, since_days: Optional[int] = None, dry_run: bool = True) -> Dict[str, Any]:
+        """从历史 turns 回填 L1 atoms / L2 scenes；默认 dry_run，不写库。"""
+        pairs = self._historical_turn_pairs(limit=limit, since_days=since_days)
+        candidate_atoms = 0
+        atoms_written = 0
+        touched_scenes = set()
+        for pair in pairs:
+            user = pair["user"]
+            assistant = pair["assistant"]
+            importance = max(int(user.get("importance") or 1), int(assistant.get("importance") or 1))
+            tags = sorted(set((user.get("tags") or []) + (assistant.get("tags") or [])))
+            atoms = self._extract_atoms_from_turn(user["content"], assistant["content"], importance, tags)
+            candidate_atoms += len(atoms)
+            if dry_run:
+                continue
+            before_ids = {row[0] for row in self._db.execute("SELECT id FROM memory_atoms").fetchall()}
+            for atom in atoms:
+                self._upsert_memory_atom(
+                    atom,
+                    user["session_id"],
+                    [user["id"], assistant["id"]],
+                    [user["trace_id"], assistant["trace_id"]],
+                )
+                touched_scenes.add(atom.get("scene_name") or atom.get("type", "default"))
+            after_ids = {row[0] for row in self._db.execute("SELECT id FROM memory_atoms").fetchall()}
+            atoms_written += max(0, len(after_ids) - len(before_ids))
+        if not dry_run:
+            self._db.commit()
+        return {
+            "dry_run": bool(dry_run),
+            "limit": limit,
+            "since_days": since_days,
+            "scanned_turn_pairs": len(pairs),
+            "candidate_atoms": candidate_atoms,
+            "atoms_written": atoms_written,
+            "scenes_updated": len(touched_scenes),
+        }
+
     def _format_atom_row(self, row) -> Dict[str, Any]:
         return {
             "id": row[0],
@@ -2302,6 +2374,19 @@ class MiniLociProvider:
                     },
                     "required": []
                 }
+            },
+            {
+                "name": "miniloci_backfill_layers",
+                "description": "从历史 turns 回填 MiniLoci L1 atoms / L2 scenes；默认 dry_run，不写库",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dry_run": {"type": "boolean", "description": "是否只统计不写入", "default": True},
+                        "limit": {"type": "integer", "description": "最多扫描 turn pairs 数", "default": 100},
+                        "since_days": {"type": "integer", "description": "可选：只扫描最近 N 天"}
+                    },
+                    "required": []
+                }
             }
         ]
     
@@ -2315,6 +2400,8 @@ class MiniLociProvider:
             return self._tool_search_scenes(args)
         if tool_name == "miniloci_persona_candidate":
             return self._tool_persona_candidate(args)
+        if tool_name == "miniloci_backfill_layers":
+            return self._tool_backfill_layers(args)
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
     def _tool_search(self, args: Dict[str, Any]) -> str:
@@ -2415,6 +2502,23 @@ class MiniLociProvider:
             return json.dumps(payload, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "error": str(e), "review_required": True, "applied": False}, ensure_ascii=False)
+
+    def _tool_backfill_layers(self, args: Dict[str, Any]) -> str:
+        """历史 L1/L2 回填工具；默认 dry_run，避免误写生产库。"""
+        try:
+            dry_run = args.get("dry_run", True)
+            if isinstance(dry_run, str):
+                dry_run = dry_run.strip().lower() not in {"false", "0", "no", "否"}
+            limit = args.get("limit", 100)
+            if limit is not None:
+                limit = int(limit)
+            since_days = args.get("since_days")
+            if since_days is not None:
+                since_days = int(since_days)
+            payload = self.backfill_memory_layers(limit=limit, since_days=since_days, dry_run=bool(dry_run))
+            return json.dumps(payload, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "error": str(e), "dry_run": args.get("dry_run", True)}, ensure_ascii=False)
     
     def on_session_end(self, messages: List[Dict[str, Any]]):
         """会话结束标记"""

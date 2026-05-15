@@ -586,6 +586,55 @@ class TestMiniLoci:
         assert payload["status"] == "generated"
         assert payload["review_required"] is True
         assert payload["applied"] is False
+
+    def test_backfill_memory_layers_dry_run_does_not_write_atoms_or_scenes(self, provider):
+        """历史 turns 回填 dry_run 只统计候选，不写入 L1/L2。"""
+        provider.sync_turn("我们决定用Docker部署MiniLoci", "Docker 部署方案已记录", session_id="backfill-session")
+        provider._db.execute("DELETE FROM scene_blocks_fts")
+        provider._db.execute("DELETE FROM scene_blocks")
+        provider._db.execute("DELETE FROM memory_atoms_fts")
+        provider._db.execute("DELETE FROM memory_atoms")
+        provider._db.commit()
+
+        result = provider.backfill_memory_layers(limit=10, dry_run=True)
+
+        assert result["dry_run"] is True
+        assert result["scanned_turn_pairs"] >= 1
+        assert result["candidate_atoms"] >= 1
+        assert provider._db.execute("SELECT COUNT(*) FROM memory_atoms").fetchone()[0] == 0
+        assert provider._db.execute("SELECT COUNT(*) FROM scene_blocks").fetchone()[0] == 0
+
+    def test_backfill_memory_layers_writes_traceable_atoms_and_scenes(self, provider):
+        """历史 turns 回填应从已有 turns 生成可追溯 atoms/scenes。"""
+        provider.sync_turn("我们决定用Docker部署MiniLoci", "Docker 部署方案已记录", session_id="backfill-session")
+        provider._db.execute("DELETE FROM scene_blocks_fts")
+        provider._db.execute("DELETE FROM scene_blocks")
+        provider._db.execute("DELETE FROM memory_atoms_fts")
+        provider._db.execute("DELETE FROM memory_atoms")
+        provider._db.commit()
+
+        result = provider.backfill_memory_layers(limit=10, dry_run=False)
+        atoms = provider.search_atoms("Docker MiniLoci", atom_type="project")
+        scenes = provider.search_scenes("Docker MiniLoci")
+
+        assert result["dry_run"] is False
+        assert result["atoms_written"] >= 1
+        assert result["scenes_updated"] >= 1
+        assert atoms
+        assert atoms[0]["source_turn_ids"]
+        assert atoms[0]["trace_ids"][0].startswith("turn-")
+        assert scenes
+        assert scenes[0]["source_turn_ids"]
+
+    def test_backfill_memory_layers_tool_schema_and_handler(self, provider):
+        """插件应暴露历史 L1/L2 回填工具，并支持 dry_run。"""
+        provider.sync_turn("以后回答不要用表格", "收到", session_id="backfill-session")
+        tool_names = [schema["name"] for schema in provider.get_tool_schemas()]
+        payload = json.loads(provider.handle_tool_call("miniloci_backfill_layers", {"dry_run": True, "limit": 5}))
+
+        assert "miniloci_backfill_layers" in tool_names
+        assert payload["dry_run"] is True
+        assert payload["scanned_turn_pairs"] >= 1
     
     def test_config_schema(self, provider):
         """测试配置Schema"""
