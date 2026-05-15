@@ -216,9 +216,34 @@ class MiniLociProvider:
                 content_rowid='id'
             );
             
+            CREATE TABLE IF NOT EXISTS memory_atoms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                type TEXT NOT NULL,
+                priority INTEGER DEFAULT 50,
+                source_turn_ids TEXT NOT NULL,
+                trace_ids TEXT NOT NULL,
+                source_session_id TEXT,
+                scene_name TEXT,
+                metadata TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5(
+                content,
+                type,
+                scene_name,
+                tokenize='unicode61',
+                content='memory_atoms',
+                content_rowid='id'
+            );
+            
             CREATE INDEX IF NOT EXISTS idx_turns_time ON turns(timestamp);
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
             CREATE INDEX IF NOT EXISTS idx_turns_importance ON turns(importance);
+            CREATE INDEX IF NOT EXISTS idx_atoms_type ON memory_atoms(type);
+            CREATE INDEX IF NOT EXISTS idx_atoms_session ON memory_atoms(source_session_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
         """)
         
@@ -266,6 +291,11 @@ class MiniLociProvider:
                 pass
             self._db.execute("UPDATE turns SET trace_id = 'turn-' || id WHERE trace_id IS NULL OR trace_id = ''")
             version = 5
+
+        if version < 6:
+            # v5 -> v6: 创建轻量 L1 memory_atoms 结构化记忆层。
+            self._create_memory_atoms_tables()
+            version = 6
         
         self._db.execute(f"PRAGMA user_version = {version}")
 
@@ -279,6 +309,34 @@ class MiniLociProvider:
                 content='turns',
                 content_rowid='id'
             )
+        """)
+
+    def _create_memory_atoms_tables(self):
+        """创建轻量 L1 结构化记忆表与 FTS 索引。"""
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_atoms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                type TEXT NOT NULL,
+                priority INTEGER DEFAULT 50,
+                source_turn_ids TEXT NOT NULL,
+                trace_ids TEXT NOT NULL,
+                source_session_id TEXT,
+                scene_name TEXT,
+                metadata TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_atoms_fts USING fts5(
+                content,
+                type,
+                scene_name,
+                tokenize='unicode61',
+                content='memory_atoms',
+                content_rowid='id'
+            );
+            CREATE INDEX IF NOT EXISTS idx_atoms_type ON memory_atoms(type);
+            CREATE INDEX IF NOT EXISTS idx_atoms_session ON memory_atoms(source_session_id);
         """)
 
     def _fts_needs_rebuild(self) -> bool:
@@ -1228,6 +1286,18 @@ class MiniLociProvider:
         except Exception as e:
             logger.debug(f"FTS sync failed: {e}")
         
+        # 轻量 L1 结构化记忆提取：先用规则提取稳定事实/长期指令，后续可替换为 LLM 提取器。
+        self._extract_and_store_atoms(
+            session_id,
+            user_content,
+            assistant_content,
+            user_rowid,
+            asst_rowid,
+            [user_trace_id, asst_trace_id],
+            importance,
+            tags,
+        )
+
         # 更新会话计数
         self._db.execute(
             "UPDATE sessions SET turn_count = turn_count + 2 WHERE id = ?",
@@ -1463,6 +1533,224 @@ class MiniLociProvider:
 
         sorted_results = sorted(enriched, key=lambda x: x['total'], reverse=True)
         return [r['data'] for r in sorted_results[:limit]]
+
+    # ==================== L1 结构化记忆 atoms ====================
+
+    def _infer_atom_scene(self, text: str, atom_type: str) -> str:
+        """为轻量 atom 生成粗粒度场景名。"""
+        if "MiniLoci" in text or "miniloci" in text:
+            return "MiniLoci 记忆系统"
+        if "Hermes" in text or "hermes" in text:
+            return "Hermes Agent"
+        if atom_type == "instruction":
+            return "用户沟通偏好"
+        if atom_type == "project":
+            return "项目决策"
+        return atom_type
+
+    def _build_atom_content(self, atom_type: str, user_msg: str, assistant_msg: str) -> str:
+        """生成独立可读的 atom 文本。"""
+        combined = re.sub(r"\s+", " ", f"{user_msg} {assistant_msg}").strip()
+        if atom_type == "instruction":
+            return f"用户要求 AI 以后回答时：{user_msg.strip()}"
+        if atom_type == "project":
+            if "决定" in user_msg:
+                return f"用户在项目中作出决策：{user_msg.strip()}"
+            return f"项目事实：{combined[:240]}"
+        if atom_type == "incident":
+            return f"问题/故障经验：{combined[:240]}"
+        return combined[:240]
+
+    def _extract_atoms_from_turn(self, user_msg: str, assistant_msg: str, importance: int, tags: List[str]) -> List[Dict[str, Any]]:
+        """轻量规则版 L1 提取器：先覆盖长期指令、项目决策、故障经验。"""
+        combined = f"{user_msg} {assistant_msg}"
+        atoms = []
+
+        instruction_markers = ["以后", "以后都", "从现在开始", "以后回答", "不要", "必须", "请记住", "记住"]
+        if any(marker in user_msg for marker in instruction_markers) and any(
+            kw in user_msg for kw in ["回答", "格式", "表格", "语气", "风格", "必须", "不要", "用"]
+        ):
+            atoms.append({"type": "instruction", "priority": 90})
+
+        project_markers = ["决定", "方案", "部署", "采用", "选择", "配置", "架构", "MiniLoci", "Hermes", "Docker"]
+        if importance >= 2 and any(marker in combined for marker in project_markers):
+            atoms.append({"type": "project", "priority": 75})
+
+        incident_markers = ["错误", "报错", "失败", "崩溃", "故障", "修复", "问题", "坑"]
+        if any(marker in combined for marker in incident_markers):
+            atoms.append({"type": "incident", "priority": 80})
+
+        # 同一 turn 内相同 type 只保留一次。
+        deduped = []
+        seen = set()
+        for atom in atoms:
+            if atom["type"] in seen:
+                continue
+            seen.add(atom["type"])
+            content = self._build_atom_content(atom["type"], user_msg, assistant_msg)
+            atom.update({"content": content, "scene_name": self._infer_atom_scene(content, atom["type"])})
+            deduped.append(atom)
+        return deduped
+
+    def _atom_similarity_terms(self, content: str) -> List[str]:
+        return self._search_terms(content, expand_synonyms=False)[:16]
+
+    def _find_similar_atom(self, atom_type: str, content: str) -> Optional[int]:
+        """用 FTS/LIKE 查找同类型近似 atom，避免重复写入。"""
+        terms = self._atom_similarity_terms(content)
+        if not terms:
+            return None
+        fts_query = " OR ".join(terms)
+        try:
+            row = self._db.execute("""
+                SELECT a.id
+                FROM memory_atoms_fts f
+                JOIN memory_atoms a ON f.rowid = a.id
+                WHERE memory_atoms_fts MATCH ? AND a.type = ?
+                ORDER BY rank
+                LIMIT 1
+            """, (fts_query, atom_type)).fetchone()
+            if row:
+                return int(row[0])
+        except Exception:
+            pass
+
+        clauses = " OR ".join(["content LIKE ?" for _ in terms[:8]])
+        try:
+            row = self._db.execute(
+                f"SELECT id FROM memory_atoms WHERE type = ? AND ({clauses}) ORDER BY updated_at DESC LIMIT 1",
+                (atom_type, *[f"%{t}%" for t in terms[:8]])
+            ).fetchone()
+            return int(row[0]) if row else None
+        except Exception:
+            return None
+
+    def _sync_atom_fts(self, atom_id: int, content: str, atom_type: str, scene_name: str):
+        try:
+            # FTS5 external-content tables do not reliably support normal DELETE syntax.
+            # INSERT OR REPLACE is sufficient for our rowid-owned lightweight atom index.
+            self._db.execute(
+                "INSERT OR REPLACE INTO memory_atoms_fts (rowid, content, type, scene_name) VALUES (?, ?, ?, ?)",
+                (atom_id, self._tokenize_for_fts(content), atom_type, self._tokenize_for_fts(scene_name))
+            )
+        except Exception as e:
+            logger.debug(f"Atom FTS sync failed: {e}")
+
+    def _upsert_memory_atom(self, atom: Dict[str, Any], session_id: str, source_turn_ids: List[int], trace_ids: List[str]):
+        now = time.time()
+        existing_id = self._find_similar_atom(atom["type"], atom["content"])
+        if existing_id:
+            row = self._db.execute(
+                "SELECT source_turn_ids, trace_ids, content, priority, scene_name FROM memory_atoms WHERE id = ?",
+                (existing_id,)
+            ).fetchone()
+            if not row:
+                return
+            merged_turn_ids = sorted(set(json.loads(row[0] or "[]") + source_turn_ids))
+            merged_trace_ids = []
+            for trace_id in json.loads(row[1] or "[]") + trace_ids:
+                if trace_id not in merged_trace_ids:
+                    merged_trace_ids.append(trace_id)
+            content = row[2] if len(row[2]) >= len(atom["content"]) else atom["content"]
+            priority = max(int(row[3] or 0), int(atom.get("priority", 50)))
+            scene_name = row[4] or atom.get("scene_name")
+            metadata = {"dedup": "merged", "updated_from_turn_ids": source_turn_ids}
+            self._db.execute("""
+                UPDATE memory_atoms
+                SET content = ?, priority = ?, source_turn_ids = ?, trace_ids = ?, scene_name = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+            """, (
+                content,
+                priority,
+                json.dumps(merged_turn_ids),
+                json.dumps(merged_trace_ids),
+                scene_name,
+                json.dumps(metadata, ensure_ascii=False),
+                now,
+                existing_id,
+            ))
+            self._sync_atom_fts(existing_id, content, atom["type"], scene_name or "")
+            return
+
+        cursor = self._db.execute("""
+            INSERT INTO memory_atoms (content, type, priority, source_turn_ids, trace_ids, source_session_id, scene_name, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            atom["content"],
+            atom["type"],
+            atom.get("priority", 50),
+            json.dumps(source_turn_ids),
+            json.dumps(trace_ids),
+            session_id,
+            atom.get("scene_name"),
+            json.dumps({"extractor": "rules-v1"}, ensure_ascii=False),
+            now,
+            now,
+        ))
+        self._sync_atom_fts(cursor.lastrowid, atom["content"], atom["type"], atom.get("scene_name") or "")
+
+    def _extract_and_store_atoms(self, session_id: str, user_msg: str, assistant_msg: str, user_rowid: int, asst_rowid: int, trace_ids: List[str], importance: int, tags: List[str]):
+        atoms = self._extract_atoms_from_turn(user_msg, assistant_msg, importance, tags)
+        for atom in atoms:
+            self._upsert_memory_atom(atom, session_id, [user_rowid, asst_rowid], trace_ids)
+
+    def _format_atom_row(self, row) -> Dict[str, Any]:
+        return {
+            "id": row[0],
+            "content": row[1],
+            "type": row[2],
+            "priority": row[3],
+            "source_turn_ids": json.loads(row[4] or "[]"),
+            "trace_ids": json.loads(row[5] or "[]"),
+            "source_session_id": row[6],
+            "scene_name": row[7],
+            "metadata": json.loads(row[8] or "{}"),
+            "created_at": row[9],
+            "updated_at": row[10],
+        }
+
+    def search_atoms(self, query: str, limit: int = 5, atom_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """搜索 L1 结构化记忆 atoms。"""
+        terms = self._search_terms(query, expand_synonyms=True)
+        if not terms:
+            return []
+        fts_query = " OR ".join(terms)
+        params = [fts_query]
+        type_clause = ""
+        if atom_type:
+            type_clause = " AND a.type = ?"
+            params.append(atom_type)
+        params.append(limit)
+        try:
+            rows = self._db.execute(f"""
+                SELECT a.id, a.content, a.type, a.priority, a.source_turn_ids, a.trace_ids,
+                       a.source_session_id, a.scene_name, a.metadata, a.created_at, a.updated_at
+                FROM memory_atoms_fts f
+                JOIN memory_atoms a ON f.rowid = a.id
+                WHERE memory_atoms_fts MATCH ?{type_clause}
+                ORDER BY rank
+                LIMIT ?
+            """, tuple(params)).fetchall()
+            return [self._format_atom_row(row) for row in rows]
+        except Exception as e:
+            self._mark_degraded("fts", e)
+            like_terms = terms[:8]
+            clauses = " OR ".join(["content LIKE ?" for _ in like_terms])
+            params = [f"%{t}%" for t in like_terms]
+            type_clause = ""
+            if atom_type:
+                type_clause = " AND type = ?"
+                params.append(atom_type)
+            params.append(limit)
+            rows = self._db.execute(f"""
+                SELECT id, content, type, priority, source_turn_ids, trace_ids,
+                       source_session_id, scene_name, metadata, created_at, updated_at
+                FROM memory_atoms
+                WHERE ({clauses}){type_clause}
+                ORDER BY priority DESC, updated_at DESC
+                LIMIT ?
+            """, tuple(params)).fetchall()
+            return [self._format_atom_row(row) for row in rows]
 
     def _calc_time_weight(self, timestamp: float) -> float:
         """计算时间权重"""

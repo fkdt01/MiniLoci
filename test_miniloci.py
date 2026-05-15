@@ -386,6 +386,51 @@ class TestMiniLoci:
         assert results
         assert health["degraded"] is True
         assert health["last_vector_error"] == "embedding backend unavailable"
+
+    def test_memory_atoms_schema_created(self, provider):
+        """L1 memory_atoms 表应在初始化时创建，作为结构化记忆层。"""
+        cols = {
+            row[1] for row in provider._db.execute("PRAGMA table_info(memory_atoms)").fetchall()
+        }
+        assert {"id", "content", "type", "priority", "source_turn_ids", "source_session_id", "created_at"}.issubset(cols)
+
+    def test_sync_turn_extracts_instruction_atom_with_source_trace(self, provider):
+        """长期指令应被提取为 instruction atom，并绑定原始 turn id。"""
+        provider.sync_turn(
+            "以后回答不要用表格，要用纯文字和 emoji bullet",
+            "收到，以后会避免表格",
+            session_id="atom-session"
+        )
+
+        atoms = provider.search_atoms("表格 emoji", limit=5)
+
+        assert atoms
+        atom = atoms[0]
+        assert atom["type"] == "instruction"
+        assert "表格" in atom["content"]
+        assert atom["source_session_id"] == "atom-session"
+        assert len(atom["source_turn_ids"]) >= 1
+        assert atom["trace_ids"][0].startswith("turn-")
+
+    def test_sync_turn_extracts_project_atom_and_deduplicates(self, provider):
+        """同一项目事实重复出现时，应更新/复用 atom，而不是无限新增。"""
+        provider.sync_turn(
+            "我们决定用Docker部署MiniLoci",
+            "Docker 部署方案已记录",
+            session_id="atom-session"
+        )
+        provider.sync_turn(
+            "再次确认，MiniLoci 还是用Docker部署",
+            "已确认 Docker 部署",
+            session_id="atom-session"
+        )
+
+        atoms = provider.search_atoms("Docker 部署 MiniLoci", limit=10)
+        deployment_atoms = [a for a in atoms if a["type"] == "project"]
+
+        assert len(deployment_atoms) == 1
+        assert "Docker" in deployment_atoms[0]["content"]
+        assert len(deployment_atoms[0]["source_turn_ids"]) >= 2
     
     def test_config_schema(self, provider):
         """测试配置Schema"""

@@ -288,6 +288,16 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.2.0 (2026-05-15)
+
+**新增 L1 memory_atoms 结构化记忆层：**
+- 新增 `memory_atoms` 表与 `memory_atoms_fts` 索引，DB schema 升级到 `user_version=6`
+- `sync_turn()` 现在会用轻量规则提取 instruction / project / incident atoms
+- 每条 atom 保存 `source_turn_ids`、`trace_ids`、`source_session_id`，可追溯到底层 turns
+- 新增 `search_atoms(query, limit, atom_type)`，用于搜索结构化记忆而不是原始对话片段
+- 初版去重：同类型相似 atom 自动合并 source turns，避免重复项目事实无限增长
+- 补充 3 个 L1 atoms 回归测试，完整测试扩展到 37 项
+
 ### v1.1.0 (2026-05-15)
 
 **P0 记忆架构升级：搜索更稳、结果可追溯、失败可诊断：**
