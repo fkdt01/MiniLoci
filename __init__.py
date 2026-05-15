@@ -50,6 +50,8 @@ class MiniLociProvider:
         self.db_path = self.db_dir / "miniloci.db"
         self.permanent_dir = self.db_dir / "permanent"
         self.permanent_dir.mkdir(parents=True, exist_ok=True)
+        self.persona_dir = self.db_dir / "persona"
+        self.persona_dir.mkdir(parents=True, exist_ok=True)
         
         # 配置
         self._config = self._load_config()
@@ -1887,6 +1889,106 @@ class MiniLociProvider:
             "updated_at": row[8],
         }
 
+    def _recent_atoms_for_persona(self, limit: int = 50) -> List[Dict[str, Any]]:
+        rows = self._db.execute("""
+            SELECT id, content, type, priority, source_turn_ids, trace_ids,
+                   source_session_id, scene_name, metadata, created_at, updated_at
+            FROM memory_atoms
+            ORDER BY priority DESC, updated_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._format_atom_row(row) for row in rows]
+
+    def _recent_scenes_for_persona(self, limit: int = 20) -> List[Dict[str, Any]]:
+        rows = self._db.execute("""
+            SELECT id, scene_name, summary, atom_ids, source_turn_ids,
+                   trace_ids, metadata, created_at, updated_at
+            FROM scene_blocks
+            ORDER BY updated_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [self._format_scene_row(row) for row in rows]
+
+    def _persona_candidate_markdown(self, atoms: List[Dict[str, Any]], scenes: List[Dict[str, Any]]) -> str:
+        """生成仅供人工审核的 L3 persona candidate Markdown。"""
+        instruction_atoms = [a for a in atoms if a.get("type") == "instruction"]
+        project_atoms = [a for a in atoms if a.get("type") == "project"]
+        incident_atoms = [a for a in atoms if a.get("type") == "incident"]
+        lines = [
+            "# MiniLoci Persona Candidate",
+            "",
+            "状态：候选草案，必须人工审核后才能写入 Hermes 长期 memory / USER。",
+            "安全原则：本文件只生成候选，不自动覆盖、不自动注入、不自动应用。",
+            "",
+            f"生成时间：{datetime.now().isoformat(timespec='seconds')}",
+            "",
+            "## 人工审核清单",
+            "- [ ] 删除临时任务进度，只保留长期稳定偏好/事实",
+            "- [ ] 检查每条候选是否有 source_turn_ids / trace_ids",
+            "- [ ] 确认不会覆盖用户当前明确指令",
+            "",
+        ]
+        if instruction_atoms:
+            lines.extend(["## 候选用户偏好 / 指令", ""])
+            for atom in instruction_atoms[:12]:
+                lines.append(f"- {atom['content']}")
+                lines.append(f"  - source_turn_ids: {atom['source_turn_ids']}")
+                lines.append(f"  - trace_ids: {atom['trace_ids']}")
+        if project_atoms:
+            lines.extend(["", "## 候选项目事实", ""])
+            for atom in project_atoms[:12]:
+                lines.append(f"- {atom['content']}")
+                lines.append(f"  - scene: {atom.get('scene_name')}")
+                lines.append(f"  - source_turn_ids: {atom['source_turn_ids']}")
+                lines.append(f"  - trace_ids: {atom['trace_ids']}")
+        if incident_atoms:
+            lines.extend(["", "## 候选故障/经验", ""])
+            for atom in incident_atoms[:8]:
+                lines.append(f"- {atom['content']}")
+                lines.append(f"  - source_turn_ids: {atom['source_turn_ids']}")
+                lines.append(f"  - trace_ids: {atom['trace_ids']}")
+        if scenes:
+            lines.extend(["", "## 相关场景摘要", ""])
+            for scene in scenes[:8]:
+                lines.append(f"### {scene['scene_name']}")
+                lines.append(scene['summary'])
+                lines.append(f"- atom_ids: {scene['atom_ids']}")
+                lines.append(f"- source_turn_ids: {scene['source_turn_ids']}")
+                lines.append(f"- trace_ids: {scene['trace_ids']}")
+                lines.append("")
+        if not atoms and not scenes:
+            lines.extend(["## 暂无候选", "", "当前没有足够的 atoms/scenes 生成候选画像。"])
+        return "\n".join(lines).rstrip() + "\n"
+
+    def generate_persona_candidate(self) -> Dict[str, Any]:
+        """生成 L3 persona candidate 文件；只写候选，不自动应用。"""
+        atoms = self._recent_atoms_for_persona()
+        scenes = self._recent_scenes_for_persona()
+        content = self._persona_candidate_markdown(atoms, scenes)
+        path = self.persona_dir / "persona_candidate.md"
+        path.write_text(content, encoding="utf-8")
+        return {
+            "status": "generated",
+            "path": str(path),
+            "review_required": True,
+            "applied": False,
+            "atom_count": len(atoms),
+            "scene_count": len(scenes),
+        }
+
+    def read_persona_candidate(self) -> Dict[str, Any]:
+        """读取 L3 persona candidate 文件。"""
+        path = self.persona_dir / "persona_candidate.md"
+        if not path.exists():
+            return {"status": "missing", "path": str(path), "review_required": True, "applied": False}
+        return {
+            "status": "found",
+            "path": str(path),
+            "content": path.read_text(encoding="utf-8"),
+            "review_required": True,
+            "applied": False,
+        }
+
     def search_scenes(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """搜索 L2 场景记忆 blocks。"""
         terms = self._search_terms(query, expand_synonyms=True)
@@ -2189,6 +2291,17 @@ class MiniLociProvider:
                     },
                     "required": ["query"]
                 }
+            },
+            {
+                "name": "miniloci_persona_candidate",
+                "description": "生成或读取 MiniLoci L3 persona_candidate.md 候选画像；只供人工审核，不自动应用到长期 memory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "description": "generate 或 read", "default": "generate"}
+                    },
+                    "required": []
+                }
             }
         ]
     
@@ -2200,6 +2313,8 @@ class MiniLociProvider:
             return self._tool_search_atoms(args)
         if tool_name == "miniloci_search_scenes":
             return self._tool_search_scenes(args)
+        if tool_name == "miniloci_persona_candidate":
+            return self._tool_persona_candidate(args)
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
     def _tool_search(self, args: Dict[str, Any]) -> str:
@@ -2288,6 +2403,18 @@ class MiniLociProvider:
             }, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"query": query, "error": str(e)}, ensure_ascii=False)
+
+    def _tool_persona_candidate(self, args: Dict[str, Any]) -> str:
+        """L3 persona candidate 工具：生成/读取候选，不应用。"""
+        action = args.get("action", "generate")
+        try:
+            if action == "read":
+                payload = self.read_persona_candidate()
+            else:
+                payload = self.generate_persona_candidate()
+            return json.dumps(payload, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"status": "error", "error": str(e), "review_required": True, "applied": False}, ensure_ascii=False)
     
     def on_session_end(self, messages: List[Dict[str, Any]]):
         """会话结束标记"""

@@ -543,6 +543,49 @@ class TestMiniLoci:
         assert payload["results"]
         assert payload["results"][0]["scene_name"] == "MiniLoci 记忆系统"
         assert payload["results"][0]["source_turn_ids"]
+
+    def test_generate_persona_candidate_file_is_traceable_and_review_only(self, provider):
+        """L3 persona_candidate 应生成可审核候选文件，不自动覆盖长期 memory。"""
+        provider.sync_turn(
+            "以后回答不要用表格，要用纯文字和 emoji bullet",
+            "收到，以后会避免表格",
+            session_id="persona-session"
+        )
+        provider.sync_turn(
+            "我们决定用Docker部署MiniLoci",
+            "Docker 部署方案已记录",
+            session_id="persona-session"
+        )
+
+        result = provider.generate_persona_candidate()
+
+        assert result["status"] == "generated"
+        assert result["review_required"] is True
+        assert result["applied"] is False
+        candidate_path = Path(result["path"])
+        assert candidate_path.exists()
+        content = candidate_path.read_text(encoding="utf-8")
+        assert "# MiniLoci Persona Candidate" in content
+        assert "人工审核" in content
+        assert "不要用表格" in content
+        assert "source_turn_ids" in content
+        assert "trace_ids" in content
+
+    def test_persona_candidate_tool_schema_and_handler(self, provider):
+        """插件应暴露生成/查看 persona candidate 的工具。"""
+        provider.sync_turn(
+            "以后回答不要用表格，要用纯文字和 emoji bullet",
+            "收到，以后会避免表格",
+            session_id="persona-session"
+        )
+
+        tool_names = [schema["name"] for schema in provider.get_tool_schemas()]
+        payload = json.loads(provider.handle_tool_call("miniloci_persona_candidate", {"action": "generate"}))
+
+        assert "miniloci_persona_candidate" in tool_names
+        assert payload["status"] == "generated"
+        assert payload["review_required"] is True
+        assert payload["applied"] is False
     
     def test_config_schema(self, provider):
         """测试配置Schema"""

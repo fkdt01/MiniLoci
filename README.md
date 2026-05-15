@@ -288,6 +288,15 @@ ls -t ~/.hermes/loci-archive/backups/*.db | head -1
 
 ## 更新日志
 
+### v1.5.0 (2026-05-15)
+
+**新增 L3 persona_candidate 候选画像层：**
+- 新增 `generate_persona_candidate()`，基于 L1 atoms 与 L2 scenes 生成 `persona/persona_candidate.md`
+- 候选文件包含用户偏好、项目事实、故障经验、相关场景摘要，并保留 `source_turn_ids` / `trace_ids`
+- 安全策略：只生成候选草案，`review_required=true`、`applied=false`，不自动覆盖 Hermes 长期 memory / USER
+- 新增 `read_persona_candidate()` 与 `miniloci_persona_candidate` 工具 schema/handler
+- 补充 2 个 L3 persona candidate 回归测试，完整测试扩展到 45 项
+
 ### v1.4.0 (2026-05-15)
 
 **新增 L2 scene_blocks 场景记忆层：**
