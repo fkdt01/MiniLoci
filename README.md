@@ -24,19 +24,51 @@
 
 ## 快速开始
 
-### 安装
+### 安装位置很重要
 
-```bash
-# 克隆到 Hermes 插件目录
-git clone https://github.com/yourusername/miniloci.git ~/.hermes/plugins/miniloci
+MiniLoci 是 Hermes Agent 的 **MemoryProvider 插件**，用户安装时必须放在：
 
-# 安装依赖
-pip install numpy sentence-transformers jieba
-# 可选：数据量很大时再安装 Faiss 加速
-# pip install faiss-cpu
+```text
+~/.hermes/plugins/miniloci/
 ```
 
-### 配置
+不要放到 `~/.hermes/plugins/memory/miniloci/`。Hermes 的用户插件扫描路径是 `~/.hermes/plugins/<name>/`，放错目录时可能不会报错，但 MiniLoci 实际不会被加载。
+
+### 1. 克隆插件
+
+```bash
+mkdir -p ~/.hermes/plugins
+git clone https://github.com/fkdt01/MiniLoci.git ~/.hermes/plugins/miniloci
+cd ~/.hermes/plugins/miniloci
+```
+
+如果目录已经存在，用更新方式即可：
+
+```bash
+cd ~/.hermes/plugins/miniloci
+git pull --ff-only origin main
+```
+
+### 2. 安装依赖
+
+推荐把依赖安装到 Hermes Agent 正在使用的 Python 环境中。常见本地部署路径如下：
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python -m pip install numpy sentence-transformers jieba
+```
+
+如果你的 Hermes 使用的是另一个虚拟环境，请把上面的 Python 路径替换成实际运行 Gateway 的 Python。
+
+可选项：
+
+```bash
+# 仅当历史数据很多、确实需要更大规模向量检索时再装
+~/.hermes/hermes-agent/venv/bin/python -m pip install faiss-cpu
+```
+
+MiniLoci 默认使用 SQLite FTS5 + numpy 向量后端；Faiss 只是可选加速，不是必需依赖。
+
+### 3. 启用 MemoryProvider
 
 在 `~/.hermes/config.yaml` 中启用：
 
@@ -46,13 +78,150 @@ memory:
   provider: miniloci
 ```
 
-### 使用
+只需要设置 `memory.provider: miniloci`。MiniLoci 不需要额外写入 `plugins.enabled`。
 
-无需额外操作，正常对话即可。当你说：
+### 4. 首次向量模型准备
+
+默认配置为：
+
+```json
+{
+  "enable_vector": true,
+  "vector_model": "BAAI/bge-small-zh-v1.5",
+  "vector_backend": "auto",
+  "vector_local_files_only": true
+}
+```
+
+含义：MiniLoci 默认只从本地 HuggingFace 缓存加载向量模型，避免 Hermes Gateway 在运行时被在线 HEAD 请求反复超时阻塞。
+
+如果本机还没有下载过模型，可以临时允许联网下载：
+
+```json
+{
+  "vector_local_files_only": false
+}
+```
+
+配置文件位置：
+
+```text
+~/.hermes/loci-archive/config.json
+```
+
+模型下载完成后，建议把 `vector_local_files_only` 改回 `true`。
+
+如果暂时不需要语义向量召回，也可以关闭向量搜索，只使用 FTS5：
+
+```json
+{
+  "enable_vector": false
+}
+```
+
+### 5. 重启或重载 Hermes
+
+本地 systemd 部署通常使用：
+
+```bash
+systemctl --user restart hermes-gateway
+```
+
+如果你的 Hermes 支持并已经连接到 Gateway，也可以优先用 `/reload-mcp` 或对应的重载方式，避免中断正在进行的会话。MemoryProvider 变更通常建议完整重启一次 Gateway，以确认初始化链路正常。
+
+### 6. 验证安装
+
+```bash
+# 确认插件目录正确
+ls ~/.hermes/plugins/miniloci/plugin.yaml
+
+# 确认 Hermes 能找到 provider
+cd ~/.hermes/hermes-agent
+source venv/bin/activate
+python -c "from plugins.memory import find_provider_dir; print(find_provider_dir('miniloci'))"
+
+# 预期输出类似：
+# /home/<user>/.hermes/plugins/miniloci
+
+# 确认数据库已创建
+ls -la ~/.hermes/loci-archive/miniloci.db
+
+# 查看 Gateway 日志中的 MiniLoci 初始化信息
+grep -i "miniloci\|loci-archive" ~/.hermes/logs/gateway.log | tail -20
+```
+
+### 基础使用
+
+安装完成后无需手动保存。Hermes 每轮正常对话结束时会把 user/assistant turn 写入 MiniLoci。普通对话不会被强行注入历史，只有出现回忆意图时才触发召回。
+
+示例：
 
 > "你还记得上次部署的问题吗？"
 
-MiniLoci 会自动搜索相关历史并注入上下文。
+MiniLoci 会搜索最近窗口内的相关历史，并把结果注入上下文。
+
+常见触发表达：
+
+- "你还记得……"
+- "我们之前讨论过……"
+- "上次那个方案……"
+- "你说过……"
+- "以前配置过……"
+
+### 结构化记忆工具
+
+v1.1+ 之后，MiniLoci 不只保存原始 turns，还会逐步生成可追溯的结构化记忆：
+
+- L0 `turns`：原始对话片段
+- L1 `memory_atoms`：偏好、项目事实、故障经验等结构化 atoms
+- L2 `scene_blocks`：按场景聚合的记忆块
+- L3 `persona_candidate.md`：候选用户画像，只供人工审核，不会自动应用到 Hermes 长期记忆
+
+已暴露的工具包括：
+
+```text
+miniloci_search            # 搜索原始历史 turns
+miniloci_search_atoms      # 搜索 L1 结构化 atoms
+miniloci_search_scenes     # 搜索 L2 场景 blocks
+miniloci_persona_candidate # 生成/读取 L3 候选画像，review-only
+miniloci_backfill_layers   # 从历史 turns 回填 L1/L2，默认 dry_run=true
+```
+
+### 历史数据回填
+
+如果你是从旧版本升级到 v1.6.0，已有的 L0 `turns` 可能还没有对应的 L1/L2 结构化记忆。可以先做 dry run：
+
+```json
+{
+  "tool": "miniloci_backfill_layers",
+  "args": {
+    "dry_run": true,
+    "limit": 100,
+    "since_days": 30
+  }
+}
+```
+
+确认结果合理、并且已经备份数据库后，再执行真实回填：
+
+```json
+{
+  "tool": "miniloci_backfill_layers",
+  "args": {
+    "dry_run": false,
+    "limit": 100,
+    "since_days": 30
+  }
+}
+```
+
+⚠️ 建议真实回填前先备份：
+
+```bash
+mkdir -p ~/.hermes/loci-archive/backups
+cp ~/.hermes/loci-archive/miniloci.db \
+  ~/.hermes/loci-archive/backups/miniloci-before-backfill-$(date +%Y%m%d-%H%M%S).db
+```
 
 ---
 
